@@ -61,9 +61,11 @@ These were measured on QMCkl **v1.1.0** (`qmckl-1.1.0.tar.gz`):
 - `qmckl_context_copy()` performs a **deep copy** (`src/qmckl_context.c:168`),
   so every handle is destroyed exactly once; no refcounting.
 - On failure, `qmckl_get_error(ctx, &code, fun, msg)` returns the stored error;
-  buffers are `QMCKL_MAX_FUN_LEN` (256) and `QMCKL_MAX_MSG_LEN` (1024)
-  (`include/qmckl.h`). `qmckl_get_error` **asserts** that the context is valid —
-  guard with `qmckl_context_check()`.
+  the buffers are `QMCKL_MAX_FUN_LEN` (256) and `QMCKL_MAX_MSG_LEN` (1024),
+  defined in the tarball's **private** `src/qmckl_error_private_type.h` and
+  **not installed**, so `context.cpp` re-defines them behind `#ifndef`.
+  `qmckl_get_error` **asserts** that the context is valid — guard with
+  `qmckl_context_check()`.
 - **Do not use `qmckl_string_of_error`**: in the v1.1.0 release tarball its
   `switch` is empty (always returns `"Unknown error"`). A locally tangled git
   build is correct. The package therefore owns its code→name table. (Upstream
@@ -72,6 +74,11 @@ These were measured on QMCkl **v1.1.0** (`qmckl-1.1.0.tar.gz`):
   TREXIO is the only external dependency (`HAVE_TREXIO`).
 - The PyPI `trexio` wheel does **not** ship a linkable `libtrexio`; it cannot
   be used as a build dependency.
+- nanobind 3.1.0: the C++ namespace is `nanobind`; `nb` no longer exists, so
+  every TU spells `namespace nb = nanobind;` and the `nb::` code of this spec
+  compiles verbatim. pybind11's `nb::register_exception<T>(...)` is gone; the
+  equivalent is the `nb::exception<T>(m, "Name", PyExc_RuntimeError)`
+  constructor, which creates the Python type and registers the translator.
 
 ---
 
@@ -92,7 +99,9 @@ qmckl-python/
 ├── src/qmckl/
 │   ├── __init__.py
 │   ├── context.py          # class Context(_core._Context) + convenience API
-│   └── errors.py           # ERROR_CODES, error_name()
+│   ├── errors.py           # ERROR_CODES, error_name()
+│   ├── py.typed            # empty, PEP 561 (the stub below is only honoured if present)
+│   └── _core.pyi           # generated at build time, installed next to the .so
 ├── tests/
 │   ├── data/h2o_5z.h5      # 4.6 MB, from the QMCkl tarball (share/qmckl/test_data)
 │   ├── test_surface.py
@@ -369,7 +378,11 @@ class QMCKLStatusError(RuntimeError): ...
 
 The module must expose nothing else at top level.
 
-### 5.7 Error-code table (emitted in M2, grown in M3)
+The emitter owns the **whole** file: the fixed part above is template text in
+`generate.py`, not a checked-in stub concatenated by CMake. M2 emits it plus
+the `BEGIN/END GENERATED BINDINGS` markers, M3 fills the markers.
+
+### 5.7 Error-code table (emitted in M2, complete at M2)
 
 The code names come from the header, never from a checked-in copy and never
 from `qmckl_string_of_error` (§2). A second, independent pass over the **raw**
@@ -423,10 +436,14 @@ struct QMCKLStatusError : std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
-[[noreturn]] void check(int64_t ctx, int32_t rc, const char *fname);
+void check(int64_t ctx, int32_t rc, const char *fname);   // returns iff rc == 0
 const char *code_name(int32_t rc);    // emitted from the header macros, §5.7
+std::string last_error_message(int64_t ctx);  // shared with the last_error binding
 }
 ```
+
+`check()` must **not** be declared `[[noreturn]]`: the `rc == 0` path returns
+normally, and a `[[noreturn]]` function that returns is undefined behaviour.
 
 `check(ctx, rc, fname)` behaviour:
 
@@ -453,6 +470,8 @@ const char *code_name(int32_t rc);    // emitted from the header macros, §5.7
   never writes a NUL terminator**. Use `char fun[QMCKL_MAX_FUN_LEN + 1]{};`
   and `char msg[QMCKL_MAX_MSG_LEN + 1]{};` — zero-initialised, one byte of
   slack. Do not shrink them to "what the message looks like".
+- Those two macros are **not** in the installed `qmckl.h` (§2): define them in
+  `context.cpp` behind `#ifndef` with the verified 256/1024 values.
 - No GIL concern: `check()` runs with the GIL re-acquired (the release scope
   closes before it is called).
 
@@ -463,8 +482,10 @@ const char *code_name(int32_t rc);    // emitted from the header macros, §5.7
 ### 6.2 `csrc/module.cpp`
 
 ```cpp
+namespace nb = nanobind;   // nanobind 3.x renamed nb -> nanobind (§2)
+
 NB_MODULE(_core, m) {
-    nb::register_exception<qmckl::QMCKLStatusError>(
+    nb::exception<qmckl::QMCKLStatusError>(
         m, "QMCKLStatusError", PyExc_RuntimeError);
 
     nb::class_<qmckl::Context>(m, "_Context")
@@ -504,14 +525,24 @@ generated functions reference them in signatures.
 ### 7.1 `src/qmckl/__init__.py`
 
 ```python
-from ._core import *              # generated functions, _Context, QMCKLStatusError
+from . import _core
+from ._core import *              # generated functions, QMCKLStatusError, ERROR_CODES
 from .context import Context
 from .errors import ERROR_CODES, error_name
-__all__ = [...]
+
+# One source of truth: every public name of the extension, plus the Pythonic
+# layer. `import *` skips `_Context` (leading underscore), which is intended:
+# users construct `Context`.
+__all__ = sorted({"Context", "error_name"}
+                 | {n for n in dir(_core) if not n.startswith("_")})
 ```
 
 `Context` subclasses `_core._Context`; generated functions accept it because the
 parameter type is `qmckl::Context &`.
+
+The package ships an empty `src/qmckl/py.typed` (PEP 561). Without it, type
+checkers ignore the installed `_core.pyi` and every generated function is
+`Any`. `wheel.packages = ["src/qmckl"]` picks it up automatically.
 
 ### 7.2 `src/qmckl/context.py`
 

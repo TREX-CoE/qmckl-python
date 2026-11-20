@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Generate the qmckl-python binding inventory from an installed qmckl.h.
 
-Milestone M1 of PLAN.md (qmckl-python spec v1): the header parser, the
-function classification, and ``--dump-json``.  The C++ and ``.pyi`` emitters
-are M3; the CLI accepts ``--cpp``/``--pyi`` now (the CLI is final) but exits
-with a pointer to M3 if either is passed.
+Milestone M2 of PLAN.md (qmckl-python spec v1): the header parser, the
+function classification, ``--dump-json``, the §5.7 error-code table read
+from the raw header text, and the M2 skeleton emission: ``--cpp`` writes the
+C++ translation unit holding ``qmckl::code_name``,
+``qmckl_python::register_error_codes`` and an empty
+``qmckl_python::register_generated`` (M3 fills it with the per-function
+bindings), and ``--pyi`` writes the hand-written ``_core.pyi`` surface.
 
 Pipeline (PLAN.md §5.1):
   1. delete ``/* … */`` and ``//…`` comments;
@@ -55,7 +58,12 @@ name *is* fatal, which is what protects the hand-audited classification.
 Usage:
   generate.py --header PATH/qmckl.h --dump-json OUT.json [--trexio|--no-trexio]
   generate.py --header PATH/qmckl.h --cpp OUT.cpp --pyi OUT.pyi [--trexio|--no-trexio]
-      (the second form is accepted for CLI stability; emission is M3)
+
+In M2, ``--cpp``/``--pyi`` emit the compilable skeleton of PLAN.md §10:
+the §5.7 error-code table (``code_name``, ``register_error_codes``) plus an
+empty ``register_generated`` / the hand-written stub surface.  M3 grows that
+skeleton into the per-function loop without changing the CLI, the file
+names, or the CMake integration.
 
 Standard library only, Python >= 3.10.
 """
@@ -597,6 +605,53 @@ def classify(functions: list[Func], trexio: bool) -> None:
 
 
 # ---------------------------------------------------------------------------
+# §5.7 Error-code table (second pass over the raw header text)
+# ---------------------------------------------------------------------------
+
+# PLAN.md §5.7: scan the *raw* header (not the stripped §5.1 text, where the
+# preprocessor lines are already gone) for the exit-code macros.  The 1.1.0
+# header writes exactly two spaces after `#define` and a mandatory
+# `((qmckl_exit_code) N)` cast, so a bare `#define QMCKL_X 3` does not occur
+# and must not be guessed at.
+_ERROR_CODE_RE = re.compile(
+    r"^\s*#\s*define\s+(QMCKL_[A-Z0-9_]+)\s+"
+    r"\(\s*\(\s*qmckl_exit_code\s*\)\s*(-?\d+)\s*\)\s*$"
+)
+
+MIN_ERROR_CODES = 30  # §5.7 sanity assertion
+
+
+def parse_error_codes(raw: str) -> list[tuple[str, int]]:
+    """§5.7: extract the (name, value) exit-code pairs, in header order."""
+    codes: list[tuple[str, int]] = []
+    seen_name: dict[str, int] = {}
+    seen_value: dict[int, str] = {}
+    for line in raw.splitlines():
+        m = _ERROR_CODE_RE.match(line)
+        if not m:
+            continue
+        name, value = m.group(1), int(m.group(2))
+        if name in seen_name:
+            raise ParseError(f"duplicate error-code macro {name} "
+                             f"(values {seen_name[name]} and {value})")
+        if value in seen_value:
+            raise ParseError(f"duplicate error-code value {value} "
+                             f"({seen_value[value]} and {name})")
+        seen_name[name] = value
+        seen_value[value] = name
+        codes.append((name, value))
+
+    if len(codes) < MIN_ERROR_CODES:
+        raise ParseError(f"only {len(codes)} error-code macros found "
+                         f"(< {MIN_ERROR_CODES}); is this the >= 1.1 header?")
+    if seen_name.get("QMCKL_SUCCESS") != 0:
+        raise ParseError("QMCKL_SUCCESS is missing or not 0")
+    if "QMCKL_INVALID_ARG_20" not in seen_name:
+        raise ParseError("QMCKL_INVALID_ARG_20 missing; not the >= 1.1 API")
+    return codes
+
+
+# ---------------------------------------------------------------------------
 # Summary and JSON dump
 # ---------------------------------------------------------------------------
 
@@ -686,17 +741,103 @@ def print_summary(functions: list[Func], trexio: bool) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Emitters (M3)
+# Emitters (M2 skeleton; M3 grows them without touching the CLI, the file
+# names, or the CMake integration — PLAN.md §10)
 # ---------------------------------------------------------------------------
 
-def emit_cpp(functions: list[Func], trexio: bool, path: Path) -> None:
-    """M3: emit the C++ binding file.  Stub for M1."""
-    raise NotImplementedError("the C++ emitter is implemented in M3 (PLAN.md §10)")
+def emit_cpp(codes: list[tuple[str, int]], header: str, path: Path) -> None:
+    """M2: emit the C++ translation unit (PLAN.md §5.7, §10).
+
+    Contains ``qmckl::code_name`` (a switch over the bare integer values,
+    so the generated file does not depend on macros a future header could
+    rename), ``qmckl_python::register_error_codes`` (the ``ERROR_CODES``
+    dict of the extension) and an empty ``register_generated`` that M3
+    fills with the per-function bindings.
+    """
+    L: list[str] = []
+    a = L.append
+    a("// generated_bindings.cpp")
+    a("//")
+    a(f"// Generated by csrc/generate.py from {header} -- DO NOT EDIT.")
+    a("//")
+    a("// Milestone M2 (PLAN.md §5.7, §10): the error-code table read from")
+    a("// the QMCKL_* macros of the installed header, plus the empty")
+    a("// register_generated() that M3 fills with the per-function bindings.")
+    a("")
+    a("#include <nanobind/nanobind.h>")
+    a("")
+    a('#include "context.hpp"')
+    a("")
+    a("// nanobind 3.x renamed its namespace from `nb` to `nanobind`.")
+    a("namespace nb = nanobind;")
+    a("")
+    a("namespace qmckl {")
+    a("")
+    a("const char *code_name(int32_t rc) {")
+    a("    switch (rc) {")
+    for name, value in codes:
+        a(f"    case {value}:")
+        a(f'        return "{name}";')
+    a("    default:")
+    a('        return "QMCKL_UNKNOWN";')
+    a("    }")
+    a("}")
+    a("")
+    a("}  // namespace qmckl")
+    a("")
+    a("namespace qmckl_python {")
+    a("")
+    a("// M2: no per-function bindings yet; M3 emits one m.def per")
+    a("// generated symbol here (PLAN.md §5.4).")
+    a("void register_generated(nb::module_ &m) { (void) m; }")
+    a("")
+    a("void register_error_codes(nb::module_ &m) {")
+    a("    nb::dict codes;")
+    for name, value in codes:
+        a(f'    codes["{name}"] = {value};')
+    a('    m.attr("ERROR_CODES") = codes;')
+    a("}")
+    a("")
+    a("}  // namespace qmckl_python")
+    path.write_text("\n".join(L) + "\n", encoding="utf-8")
 
 
-def emit_pyi(functions: list[Func], trexio: bool, path: Path) -> None:
-    """M3: emit the _core.pyi stub.  Stub for M1."""
-    raise NotImplementedError("the .pyi emitter is implemented in M3 (PLAN.md §10)")
+def emit_pyi(header: str, path: Path) -> None:
+    """M2: emit the _core.pyi stub (PLAN.md §5.6).
+
+    The hand-written surface only.  M3 inserts the per-function defs
+    between the BEGIN/END GENERATED BINDINGS markers.
+    """
+    L: list[str] = []
+    a = L.append
+    a(f"# _core.pyi -- generated by csrc/generate.py from {header} -- DO NOT EDIT.")
+    a("#")
+    a("# Milestone M2 (PLAN.md §5.6): the hand-written surface of the")
+    a("# qmckl._core extension.  The module exposes nothing else at top level.")
+    a("")
+    a("ERROR_CODES: dict[str, int]")
+    a("")
+    a("")
+    a("class _Context:")
+    a("    def __init__(self) -> None: ...")
+    a("    def __init__(self, other: _Context) -> None: ...")
+    a("    def touch(self) -> None: ...")
+    a("    def valid(self) -> bool: ...")
+    a("    @property")
+    a("    def handle(self) -> int: ...")
+    a("")
+    a("")
+    a("class QMCKLStatusError(RuntimeError): ...")
+    a("")
+    a("")
+    a("def last_error(ctx: _Context) -> str: ...")
+    a("")
+    a("def get_ao_basis_type(ctx: _Context) -> str: ...")
+    a("")
+    a("")
+    a("# BEGIN GENERATED BINDINGS (M3 inserts one def per generated symbol)")
+    a("# END GENERATED BINDINGS")
+    path.write_text("\n".join(L) + "\n", encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -711,9 +852,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--header", required=True, metavar="PATH/qmckl.h",
                    help="installed qmckl.h to parse")
     p.add_argument("--cpp", metavar="OUT.cpp",
-                   help="C++ emitter output (M3; refused in M1)")
+                   help="C++ emitter output (§5.7 error table + "
+                        "register_generated; empty binding set in M2)")
     p.add_argument("--pyi", metavar="OUT.pyi",
-                   help="stub emitter output (M3; refused in M1)")
+                   help="stub emitter output (the hand-written §5.6 surface "
+                        "in M2)")
     g = p.add_mutually_exclusive_group()
     g.add_argument("--trexio", dest="trexio", action="store_true", default=True,
                    help="the linked library exports qmckl_trexio_read (default)")
@@ -727,24 +870,36 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[list[str]] = None) -> int:
     args = build_arg_parser().parse_args(argv)
     if not args.cpp and not args.pyi and not args.dump_json:
-        print("generate.py: nothing to do: pass --dump-json (M1) "
-              "and/or --cpp/--pyi (M3)", file=sys.stderr)
-        return 2
-    if args.cpp or args.pyi:
-        print(f"generate.py: C++/.pyi emission is implemented in M3 "
-              f"(PLAN.md §10); M1 supports --dump-json only. "
-              f"Refusing to emit {args.cpp or args.pyi}.", file=sys.stderr)
+        print("generate.py: nothing to do: pass --dump-json and/or "
+              "--cpp/--pyi", file=sys.stderr)
         return 2
     try:
         functions = parse_header(Path(args.header))
         classify(functions, trexio=args.trexio)
+        # The §5.7 error-code table is a second, independent pass over the
+        # *raw* header text (the §5.1 pipeline has already deleted the
+        # preprocessor lines), so re-read the file rather than reusing the
+        # stripped text.  Needed only by the emitters; --dump-json keeps
+        # its M1 behaviour byte for byte.
+        codes: Optional[list[tuple[str, int]]] = None
+        if args.cpp or args.pyi:
+            raw = Path(args.header).read_text(encoding="utf-8")
+            codes = parse_error_codes(raw)
     except ParseError as e:
         print(f"generate.py: error: {e}", file=sys.stderr)
         return 1
     print_summary(functions, args.trexio)
+    if codes is not None:
+        first, last = codes[0], codes[-1]
+        print(f"error codes: {len(codes)} macros "
+              f"({first[0]}={first[1]} .. {last[0]}={last[1]})")
     if args.dump_json:
         Path(args.dump_json).write_text(
             to_json(functions, args.trexio, args.header) + "\n", encoding="utf-8")
+    if args.cpp:
+        emit_cpp(codes, args.header, Path(args.cpp))
+    if args.pyi:
+        emit_pyi(args.header, Path(args.pyi))
     return 0
 
 
