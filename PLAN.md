@@ -1055,6 +1055,35 @@ current majors in the same change (`actions/checkout@v7`,
 `mamba-org/setup-micromamba@v3`), the previous pins warning about
 deprecated Node 20.
 
+**Second CI run (44791325252) ran every functional step green on all
+four cells** — ubuntu py3.10 and py3.12 `56 passed`, the no-TREXIO cell
+`51 passed` + 5 skipped, the `macos-latest` cell `56 passed` — and the
+macOS job went red only in its *post* phase: the job-wide
+`DYLD_LIBRARY_PATH` (written to `$GITHUB_ENV`) reached the action post
+steps, where Homebrew's `gtar` and `git` loaded the conda env's
+`libiconv.2.dylib` and aborted with `Symbol not found: _iconv`, killing
+the cache save, the micromamba deinit and `git version`. The ubuntu
+cells' shared micromamba env-cache key also produced a cache-save
+contention warning — benign, one job wins the save.
+
+**Loader variables are step-scoped on purpose.** The variables are
+written to the `env:` of the three steps that import the extension
+(Install, presence check, Test), not to `$GITHUB_ENV`: `$GITHUB_ENV` and
+job-level `env:` also reach the action post steps, whereas step-level
+`env:` does not, and the job-wide form is what caused the post-phase
+failure above. Linux ignores `DYLD_LIBRARY_PATH` and macOS ignores
+`LD_LIBRARY_PATH`, so the same pair is written once per importing step
+and covers both OSes. On Linux the variables are what locates
+`libqmckl` itself: the extension records `DT_NEEDED libqmckl.so.1`, a
+SONAME rather than a path, and the library is not a CMake target, so no
+rpath is generated for it. On macOS the extension records an absolute
+path to `libqmckl.1.dylib`, and the locally built dylibs carry baked-in
+`LC_RPATH` entries (QMCkl's libtool bakes the `-L` directories in, one
+of them the conda env's `lib/`), so an import without the variables
+already succeeds there; keeping the same pair on both OSes makes the
+import independent of what libtool happens to bake in, and costs
+nothing.
+
 **TREXIO probe corrected during M6.** The original premise did not hold:
 `qmckl.h` declares `qmckl_trexio_read` unconditionally, and the 1.1.0
 release tarball defines it even under `--without-trexio`, as a stub
@@ -1078,7 +1107,7 @@ expectation: `trexio_read` unbound, presence check passing with
 | M3 | C++ + `.pyi` emitters (§5.4, §5.5e, §5.6), ABI override, stub installed, `tests/test_surface.py` + `tests/test_generated.py` | `import qmckl` exposes **223** generated names (222 without TREXIO) plus `Context`/`_Context`, `last_error`, `get_ao_basis_type`, `QMCKLStatusError` and `ERROR_CODES`; `qmckl_check` and `string_of_error` are absent; both test files green; the wheel ships `_core.pyi` and `py.typed`; a rebuild is byte-identical to the re-cut `--dump-json` baseline |
 | M4 | §7 Python layer + `errors.py` table | `test_shapes.py` **and** `test_blas.py` green |
 | M5 | `tests/test_distance.py` + `tests/test_trexio.py`, completing the suite | green on macOS arm64 against QMCkl 1.1.0 |
-| M6 | `.github/workflows/ci.yml`, four jobs | green on ubuntu + macos, including the `--without-trexio` job — first CI run 44789003065 failed all four cells (retired `macos-14` label; no BLAS/LAPACK on the runners), fixed with `macos-latest` + conda `openblas` + `--with-blas`/`--with-lapack`; 2026-11-20 dry runs against the 1.1.0 tarball from a conda-forge env: with-TREXIO 56 passed; no-TREXIO 51 passed, 5 skipped |
+| M6 | `.github/workflows/ci.yml`, four jobs | green on ubuntu + macos, including the `--without-trexio` job — run 44789003065: all four cells failed (retired `macos-14` label; no BLAS/LAPACK on the runners), fixed with `macos-latest` + conda `openblas` + `--with-blas`/`--with-lapack`; run 44791325252: every functional step green on all four cells (56 passed; 51 passed + 5 skipped no-TREXIO) but the macOS job died in its post phase (job-wide `DYLD_LIBRARY_PATH` → conda `libiconv` vs Homebrew `gtar`/`git`), fixed by step-scoped loader vars — run #3 will decide; 2026-11-20 dry runs from a conda-forge env: with-TREXIO 56 passed; no-TREXIO 51 passed, 5 skipped |
 
 The M6 acceptance is met once the repository has a GitHub remote and the
 workflow has run at least once there, since it cannot be executed locally;

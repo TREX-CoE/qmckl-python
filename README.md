@@ -186,7 +186,10 @@ classifies the declarations, and writes `generated_bindings.cpp` and
 CI builds QMCkl 1.1.0 from the pinned release tarball against a conda-forge
 TREXIO/gfortran/OpenBLAS environment (micromamba) and runs the suite on
 ubuntu py3.10/py3.12 and macos-latest py3.12, plus one `--without-trexio`
-job, which verifies `trexio_read` is not bound.
+job, which verifies `trexio_read` is not bound. The shared-library path is
+set per step, not job-wide, because a job-wide `DYLD_LIBRARY_PATH` makes
+Homebrew's `git`/`gtar` load the conda env's `libiconv` and abort the
+job's post steps.
 
 ## License
 

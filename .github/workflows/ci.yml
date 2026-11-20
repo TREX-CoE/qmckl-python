@@ -76,13 +76,11 @@ jobs:
           make -j"$(getconf _NPROCESSORS_ONLN)"
           make install
 
-      - name: Point pkg-config and the loader at QMCkl
+      - name: Point pkg-config at QMCkl
         run: |
           set -euo pipefail
           ENV_PREFIX="${{ steps.conda.outputs.environment-path }}"
           echo "PKG_CONFIG_PATH=${GITHUB_WORKSPACE}/qmckl/lib/pkgconfig:${ENV_PREFIX}/lib/pkgconfig" >> "$GITHUB_ENV"
-          echo "LD_LIBRARY_PATH=${GITHUB_WORKSPACE}/qmckl/lib:${ENV_PREFIX}/lib" >> "$GITHUB_ENV"
-          echo "DYLD_LIBRARY_PATH=${GITHUB_WORKSPACE}/qmckl/lib:${ENV_PREFIX}/lib" >> "$GITHUB_ENV"
           export PKG_CONFIG_PATH="${GITHUB_WORKSPACE}/qmckl/lib/pkgconfig:${ENV_PREFIX}/lib/pkgconfig"
           if ! ver=$(pkg-config --modversion qmckl); then
             echo "qmckl.pc not found or unreadable (PKG_CONFIG_PATH=${PKG_CONFIG_PATH})" >&2
@@ -90,7 +88,14 @@ jobs:
           fi
           echo "qmckl ${ver}"
 
+      # LD_/DYLD_LIBRARY_PATH are step-scoped on purpose: a job-wide
+      # DYLD_LIBRARY_PATH makes Homebrew's git/gtar load conda's
+      # libiconv.2.dylib and abort with "Symbol not found: _iconv",
+      # killing the action post steps (PLAN.md §9).
       - name: Install the package
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/qmckl/lib:${{ steps.conda.outputs.environment-path }}/lib
+          DYLD_LIBRARY_PATH: ${{ github.workspace }}/qmckl/lib:${{ steps.conda.outputs.environment-path }}/lib
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
@@ -100,9 +105,14 @@ jobs:
       - name: TREXIO is bound exactly when the library has TREXIO support
         env:
           EXPECT_TREXIO: ${{ matrix.trexio }}
+          LD_LIBRARY_PATH: ${{ github.workspace }}/qmckl/lib:${{ steps.conda.outputs.environment-path }}/lib
+          DYLD_LIBRARY_PATH: ${{ github.workspace }}/qmckl/lib:${{ steps.conda.outputs.environment-path }}/lib
         run: |
           set -euo pipefail
           python -c 'import os, qmckl; bound = hasattr(qmckl, "trexio_read"); want = os.environ["EXPECT_TREXIO"] == "true"; assert bound is want, f"trexio_read bound={bound}, expected {want}"'
 
       - name: Test
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/qmckl/lib:${{ steps.conda.outputs.environment-path }}/lib
+          DYLD_LIBRARY_PATH: ${{ github.workspace }}/qmckl/lib:${{ steps.conda.outputs.environment-path }}/lib
         run: python -m pytest -q
