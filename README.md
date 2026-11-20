@@ -159,13 +159,20 @@ raw column-major functions remain available as `qmckl._core.dgemm` and
    that as a free slot, the next allocation overwrites the record, and the
    context's allocation counter never returns to zero.  An assert-enabled
    `qmckl_context_destroy` then aborts.
+9. **`qmckl_distance` checks LDB with transa's bit** (QMCkl 1.1.0,
+   `qmckl_distance_f.F90`; `distance_sq` and `distance_rescaled` are fine).
+   With `transa='T', transb='N'` it spuriously demands `ldb >= n` and raises
+   `QMCKL_INVALID_ARG_9` for the usual packed `ldb = 3`.  The test suite pins
+   `n = 3`, the only size that passes all four flag combinations.
 
 ## Development
 
 ```sh
 pytest -q                                   # needs a QMCkl prefix in PKG_CONFIG_PATH
+
+# inspect what would be generated
 python csrc/generate.py --header $(pkg-config --variable=includedir qmckl)/qmckl.h \
-       --dump-json /tmp/qmckl_api.json      # inspect what would be generated
+       --dump-json ~/OpenCode/tmp/qmckl_api.json
 ```
 
 The generator is the only place that knows about C types. It parses the header,

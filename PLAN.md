@@ -947,8 +947,8 @@ single source of truth. `ERROR_CODES` covers `QMCKL_SUCCESS`,
 | `test_context.py` | **M2**: create, `valid()`, `handle`, `touch()`, GC (no crash, no leak report), `Context.copy()` returns a distinct valid context (`copy.handle != ctx.handle`); **M4**: deep independence via a setter (`set_point` then read back); the `touch()` re-derivation check lives in `test_shapes.py` |
 | `test_errors.py` | **M2**: `get_ao_basis_type` on a fresh context raises `QMCKLStatusError` whose message starts `[QMCKL_NOT_PROVIDED]` and does **not** contain `Unknown error`; `ERROR_CODES["QMCKL_SUCCESS"] == 0`; `error_name(103) == "QMCKL_INVALID_CONTEXT"`; `last_error(ctx)` returns a `str`; **M3+**: undersized buffer on `get_ao_basis_ao_value` raises with `QMCKL_INVALID_ARG_` |
 | `test_blas.py` | **M4**: `qmckl.dgemm(ctx, A, B, transa=…, transb=…)` (§7.2b) equals `alpha * op(A) @ op(B)` for all four combinations, with the *inputs* built per combination (op(A) = (3, 2), op(B) = (2, 4)) so a transposed reading of either buffer cannot pass; `ValueError` on shape mismatch, bad flag and empty operands; `adjugate_safe` vs `np.linalg.inv(A) * det` for a small matrix |
-| `test_distance.py` | `distance`, `distance_sq`, `distance_rescaled` vs NumPy, including transposed layouts |
-| `test_trexio.py` | `ctx.trexio_read("tests/data/h2o_5z.h5")`; `elec_num == 10`, `nucl_num == 2`, `ao_num`/`mo_num` > 0; `mo_value` compared to reference numbers copied from the upstream C tests (`tests/test_qmckl_mo.c` in the QMCkl release tarball); whole module skipped when `qmckl.trexio_read` is absent |
+| `test_distance.py` | `distance_sq`, `distance` and `distance_rescaled` against NumPy — `C[i,j] = |A_i - B_j|^2`, `|A_i - B_j|`, `(1 - exp(-kappa*r_ij))/kappa` with `kappa = 2.5` — for non-square `m != n`, in all four `transa`/`transb` combinations. `'N'` takes `A` as C-contiguous `(m, 3)` with `lda = 3`; `'T'` takes `A` as `(3, m)` with `lda = m` (verified in `src/qmckl_distance_f.F90`: `'T'` indexes `A(i,1..3)`, i.e. x's contiguous, then y's, then z's). The `C` buffer is C-contiguous `(n, m)` with `ldc = m`, read back as `.T` — the same convention as `dgemm`. A bad flag, `m == 0` or `lda < 3` raise `QMCKLStatusError` with `QMCKL_INVALID_ARG_*`. `n` is pinned to 3 and `m` to 4: trap 10 makes `n == 3` the only size accepted in all four flag combinations by `qmckl_distance` |
+| `test_trexio.py` | `ctx.trexio_read("tests/data/h2o_5z.h5")`; `elec_num == 10`, `nucl_num == 3`, nuclear charges `[8, 1, 1]`, `ao_num == 266`, `mo_num == 201`; the two cross-provider identities `mo_vgl[:, 0, :] == mo_value` and `ao_vgl[:, 0, :] == ao_value` (measured exactly 0.0 — this is what upstream's `tests/test_qmckl_mo.c` asserts; that file carries **no** hardcoded numbers, only such identities and a rescale check); `en_potential[w] == sum_{i in w} sum_k -Z_k/r_ik` and `ee_potential[w] == sum_{i<j} 1/r_ij` recomputed in NumPy from `nucl_coord`/`nucleus_charge` and from a 2-walker `electron_coord` (measured to 1.4e-14 and 7.1e-15); whole module skipped when `qmckl.trexio_read` is absent |
 | `test_shapes.py` | each property of §7.2 has the documented shape; set/get round-trip of `point`, `nucl_coord`, `electron_coord`; wrong shapes raise `ValueError`; `touch()` recomputes an unchanged distance; the four point-evaluated properties raise `ValueError` with no points; the basis-dependent ones use `tests/data/h2o_5z.h5` and skip without TREXIO |
 
 `tests/data/h2o_5z.h5` is copied from `share/qmckl/test_data/` of the release
@@ -986,7 +986,7 @@ No test may depend on the user's QMCkl prefix beyond `pkg-config`.
 | M2 | `context.hpp/.cpp`, `module.cpp`, exception, §5.7 error table, generator skeleton emission, `context.py`/`errors.py` skeleton, `test_context.py`, `test_errors.py` | `pytest -q tests` green with zero generated bindings |
 | M3 | C++ + `.pyi` emitters (§5.4, §5.5e, §5.6), ABI override, stub installed, `tests/test_surface.py` + `tests/test_generated.py` | `import qmckl` exposes **223** generated names (222 without TREXIO) plus `Context`/`_Context`, `last_error`, `get_ao_basis_type`, `QMCKLStatusError` and `ERROR_CODES`; `qmckl_check` and `string_of_error` are absent; both test files green; the wheel ships `_core.pyi` and `py.typed`; a rebuild is byte-identical to the re-cut `--dump-json` baseline |
 | M4 | §7 Python layer + `errors.py` table | `test_shapes.py` **and** `test_blas.py` green |
-| M5 | full test suite | green on macOS arm64 against QMCkl 1.1.0 |
+| M5 | `tests/test_distance.py` + `tests/test_trexio.py`, completing the suite | green on macOS arm64 against QMCkl 1.1.0 |
 | M6 | CI | green on ubuntu + macos, including the `--without-trexio` job |
 
 **Ordering constraint M2 ↔ M3.** The runtime cannot be tested without a
@@ -1040,6 +1040,17 @@ without changing the CLI, the file names, or the CMake integration.
    `n_allocated` stays incremented, so it can never return to zero — an
    assert-enabled `qmckl_context_destroy` aborts.  The properties raise
    `ValueError` instead.
+10. **`qmckl_distance` checks LDB with the wrong bit** — in
+    `src/qmckl_distance_f.F90` only `qmckl_distance` gates its LDB checks on
+    `iand(transab,1)` (transa's bit) instead of `iand(transab,2)`
+    (`distance_sq` and `distance_rescaled` are correct; `distance_sq` also
+    reports an LDB problem as `INVALID_ARG_7`).  The result: with
+    `transa='T', transb='N'` it demands `ldb >= n` and rejects the packed
+    `ldb = 3` with `QMCKL_INVALID_ARG_9`, and with `transa='N', transb='T'`
+    it demands `ldb >= 3`.  For the packed layouts of §8 only `n == 3`
+    satisfies both, so `tests/test_distance.py` pins `n = 3`.  This is an
+    upstream defect, not a binding one: the raw layer stays a faithful
+    passthrough.
 
 ---
 
