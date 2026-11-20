@@ -12,34 +12,34 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { label: "ubuntu · py3.10 · trexio",    os: ubuntu-latest, python: "3.10", trexio: "true",  qmckl_flags: "" }
-          - { label: "ubuntu · py3.12 · trexio",    os: ubuntu-latest, python: "3.12", trexio: "true",  qmckl_flags: "" }
-          - { label: "macos-14 · py3.12 · trexio",  os: macos-14,      python: "3.12", trexio: "true",  qmckl_flags: "" }
-          - { label: "ubuntu · py3.12 · no-trexio", os: ubuntu-latest, python: "3.12", trexio: "false", qmckl_flags: "--without-trexio" }
+          - { label: "ubuntu · py3.10 · trexio",       os: ubuntu-latest, python: "3.10", trexio: "true",  qmckl_flags: "" }
+          - { label: "ubuntu · py3.12 · trexio",       os: ubuntu-latest, python: "3.12", trexio: "true",  qmckl_flags: "" }
+          - { label: "macos-latest · py3.12 · trexio", os: macos-latest,  python: "3.12", trexio: "true",  qmckl_flags: "" }
+          - { label: "ubuntu · py3.12 · no-trexio",    os: ubuntu-latest, python: "3.12", trexio: "false", qmckl_flags: "--without-trexio" }
     env:
       QMCKL_VERSION: "1.1.0"
       QMCKL_SHA256: "3e1d957a570dd8b05d9a58250520fc9817afb50ab1b4d412becde85bd1029e3e"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python }}
 
       - name: Conda environment (TREXIO, HDF5, gfortran)
         id: conda
-        uses: mamba-org/setup-micromamba@v2
+        uses: mamba-org/setup-micromamba@v3
         with:
           environment-name: qmckl-env
           micromamba-root-path: ${{ github.workspace }}/.mamba
           create-args: >-
             -c conda-forge
-            trexio hdf5 gfortran
+            trexio hdf5 gfortran openblas
           cache-environment: true
 
       - name: Restore the QMCkl prefix
         id: qmckl-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: qmckl
           key: qmckl-${{ env.QMCKL_VERSION }}-${{ runner.os }}-${{ runner.arch }}-trexio-${{ matrix.trexio }}
@@ -63,9 +63,15 @@ jobs:
           export PATH="${ENV_PREFIX}/bin:${PATH}"
           export FC="${ENV_PREFIX}/bin/gfortran"
           if [ -n "${QMCKL_FLAGS}" ]; then
-            ./configure --prefix="${GITHUB_WORKSPACE}/qmckl" --without-openmp ${QMCKL_FLAGS}
+            ./configure --prefix="${GITHUB_WORKSPACE}/qmckl" --without-openmp \
+              --with-blas="-L${ENV_PREFIX}/lib -lopenblas" \
+              --with-lapack="-L${ENV_PREFIX}/lib -lopenblas" \
+              ${QMCKL_FLAGS}
           else
-            ./configure --prefix="${GITHUB_WORKSPACE}/qmckl" --without-openmp --with-trexio="${ENV_PREFIX}"
+            ./configure --prefix="${GITHUB_WORKSPACE}/qmckl" --without-openmp \
+              --with-blas="-L${ENV_PREFIX}/lib -lopenblas" \
+              --with-lapack="-L${ENV_PREFIX}/lib -lopenblas" \
+              --with-trexio="${ENV_PREFIX}"
           fi
           make -j"$(getconf _NPROCESSORS_ONLN)"
           make install

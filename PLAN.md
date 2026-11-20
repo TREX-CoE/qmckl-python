@@ -978,23 +978,29 @@ QMCkl 1.1.0 release tarball, macOS arm64). One `test` job, `fail-fast:
 false`, `QMCKL_VERSION` and the tarball's sha256 pinned as job env.
 
 1. Four matrix cells: `ubuntu-latest` py3.10 and py3.12 with TREXIO,
-   `macos-14` py3.12 with TREXIO, and one `ubuntu-latest` py3.12
+   `macos-latest` py3.12 with TREXIO, and one `ubuntu-latest` py3.12
    `--without-trexio` job (it carries `qmckl_flags: --without-trexio` and
-   `trexio: "false"`).
-2. `mamba-org/setup-micromamba@v2` builds `qmckl-env` from conda-forge with
-   `trexio hdf5 gfortran` (conda-forge has `osx-arm64` TREXIO builds;
-   `gfortran` supplies the Fortran compiler, since QMCkl always compiles its
-   `.F90` sources and macOS runners ship none — the build step points `FC`
-   at `$ENV_PREFIX/bin/gfortran`, which `AC_PROG_FC` honours). The
-   environment is cached (`cache-environment: true`) and its prefix is read
-   from the action's `environment-path` output.
+   `trexio: "false"`). The macOS cell was pinned to `macos-14` until the
+   first CI run: macOS 14 was retired 2026-11-02 (deprecation began
+   2026-07-06), so the cell moved to `macos-latest` — a pinned label is
+   exactly what expired.
+2. `mamba-org/setup-micromamba@v3` builds `qmckl-env` from conda-forge with
+   `trexio hdf5 gfortran openblas` (conda-forge has `osx-arm64` TREXIO
+   builds; `gfortran` supplies the Fortran compiler, since QMCkl always
+   compiles its `.F90` sources and macOS runners ship none — the build step
+   points `FC` at `$ENV_PREFIX/bin/gfortran`, which `AC_PROG_FC` honours;
+   `openblas` supplies BLAS and LAPACK, paragraph below). The environment
+   is cached (`cache-environment: true`) and its prefix is read from the
+   action's `environment-path` output.
 3. The release tarball is downloaded with `curl` and verified against the
    pinned sha256 (`sha256sum -c -` on Linux, `shasum -a 256 -c -` on macOS),
    then configured with `--prefix=$PWD/qmckl --without-openmp`
-   (§11 trap 6) plus `--with-trexio=$ENV_PREFIX`. The directory form is
-   what `configure.ac` turns into `-I$dir/include -L$dir/lib -ltrexio`
-   directly, so the conda TREXIO package needs no `.pc` file. The `qmckl/`
-   prefix is cached with `actions/cache@v4` keyed on
+   (§11 trap 6), `--with-blas="-L$ENV_PREFIX/lib -lopenblas"` and
+   `--with-lapack="-L$ENV_PREFIX/lib -lopenblas"` (paragraph below), and
+   `--with-trexio=$ENV_PREFIX`. The directory form is what `configure.ac`
+   turns into `-I$dir/include -L$dir/lib -ltrexio` directly, so the conda
+   TREXIO package needs no `.pc` file. The `qmckl/` prefix is cached with
+   `actions/cache@v6` keyed on
    `qmckl-<version>-<runner.os>-<runner.arch>-trexio-<flag>`; on a hit the
    build step is skipped.
 4. `make -j"$(getconf _NPROCESSORS_ONLN)"` and `make install`. No race on
@@ -1017,6 +1023,37 @@ false`, `QMCKL_VERSION` and the tarball's sha256 pinned as job env.
    without TREXIO, where the CMake `nm` probe (§4) binds `trexio_read`
    only if the library was built with TREXIO support (the `trexio_open`
    probe, §4.2 item 3).
+
+**BLAS and LAPACK.** QMCkl needs both, and a bare runner supplies
+neither: `m4/ax_blas.m4` has a `-framework vecLib` branch, but
+`m4/ax_lapack.m4` has none (it only ever tries `-llapack`), so a macOS
+runner fails the auto-detection as well. The conda env therefore carries
+`openblas`, and the build step tells configure where it is instead of
+relying on a search path: `--with-blas="-L${ENV_PREFIX}/lib
+-lopenblas" --with-lapack="-L${ENV_PREFIX}/lib -lopenblas"` — one library
+provides both symbol sets, on both operating systems. Measured against
+the 1.1.0 tarball: configure then exits 0 with `checking for dgemm_ in
+-L<env>/lib -lopenblas... yes` and `checking for cheev_ in -L<env>/lib
+-lopenblas... yes`, and the Makefile ends up with `LAPACK_LIBS =
+-L<env>/lib -lopenblas`, `BLAS_LIBS =` (emptied by the `BLAS_LIBS ==
+LAPACK_LIBS` rule at `configure.ac:291`) and `LIBS = -L<env>/lib
+-lopenblas -lpthread -lm`.
+
+**First CI run (44789003065) failed all four cells, for two reasons
+outside the package.** The `macos-14` cell never ran a step — GitHub
+answered `The configuration 'macos-14-arm64-us-default' is not
+supported` (macOS 14 retired 2026-11-02, actions/runner-images#13518).
+The three ubuntu cells died in the QMCkl build step with `configure:
+error: BLAS was not found.`: the runners ship no BLAS/LAPACK, and the
+local dry run had borrowed Homebrew's `libblas` and TREXIO, which the
+runners lack — the dry run's fidelity gap. Fixed by `macos-latest`,
+conda `openblas` in the env, and the explicit `--with-blas`/
+`--with-lapack` flags (paragraph above); the dry run was re-mirrored on a
+real conda-forge env accordingly. The four actions were bumped to their
+current majors in the same change (`actions/checkout@v7`,
+`actions/setup-python@v7`, `actions/cache@v6`,
+`mamba-org/setup-micromamba@v3`), the previous pins warning about
+deprecated Node 20.
 
 **TREXIO probe corrected during M6.** The original premise did not hold:
 `qmckl.h` declares `qmckl_trexio_read` unconditionally, and the 1.1.0
@@ -1041,7 +1078,7 @@ expectation: `trexio_read` unbound, presence check passing with
 | M3 | C++ + `.pyi` emitters (§5.4, §5.5e, §5.6), ABI override, stub installed, `tests/test_surface.py` + `tests/test_generated.py` | `import qmckl` exposes **223** generated names (222 without TREXIO) plus `Context`/`_Context`, `last_error`, `get_ao_basis_type`, `QMCKLStatusError` and `ERROR_CODES`; `qmckl_check` and `string_of_error` are absent; both test files green; the wheel ships `_core.pyi` and `py.typed`; a rebuild is byte-identical to the re-cut `--dump-json` baseline |
 | M4 | §7 Python layer + `errors.py` table | `test_shapes.py` **and** `test_blas.py` green |
 | M5 | `tests/test_distance.py` + `tests/test_trexio.py`, completing the suite | green on macOS arm64 against QMCkl 1.1.0 |
-| M6 | `.github/workflows/ci.yml`, four jobs | green on ubuntu + macos, including the `--without-trexio` job — 2026-11-20 dry runs against the 1.1.0 tarball: with-TREXIO 56 passed; no-TREXIO 51 passed, 5 skipped |
+| M6 | `.github/workflows/ci.yml`, four jobs | green on ubuntu + macos, including the `--without-trexio` job — first CI run 44789003065 failed all four cells (retired `macos-14` label; no BLAS/LAPACK on the runners), fixed with `macos-latest` + conda `openblas` + `--with-blas`/`--with-lapack`; 2026-11-20 dry runs against the 1.1.0 tarball from a conda-forge env: with-TREXIO 56 passed; no-TREXIO 51 passed, 5 skipped |
 
 The M6 acceptance is met once the repository has a GitHub remote and the
 workflow has run at least once there, since it cannot be executed locally;

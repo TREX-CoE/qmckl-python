@@ -184,9 +184,9 @@ classifies the declarations, and writes `generated_bindings.cpp` and
 ## Continuous integration
 
 CI builds QMCkl 1.1.0 from the pinned release tarball against a conda-forge
-TREXIO/gfortran environment (micromamba) and runs the suite on ubuntu
-py3.10/py3.12 and macos-14 py3.12, plus one `--without-trexio` job, which
-verifies `trexio_read` is not bound.
+TREXIO/gfortran/OpenBLAS environment (micromamba) and runs the suite on
+ubuntu py3.10/py3.12 and macos-latest py3.12, plus one `--without-trexio`
+job, which verifies `trexio_read` is not bound.
 
 ## License
 
