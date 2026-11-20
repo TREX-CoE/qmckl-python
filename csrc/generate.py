@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Generate the qmckl-python binding inventory from an installed qmckl.h.
+"""Generate the qmckl-python bindings from an installed qmckl.h.
 
-Milestone M2 of PLAN.md (qmckl-python spec v1): the header parser, the
+Milestone M3 of PLAN.md (qmckl-python spec v1): the header parser, the
 function classification, ``--dump-json``, the §5.7 error-code table read
-from the raw header text, and the M2 skeleton emission: ``--cpp`` writes the
-C++ translation unit holding ``qmckl::code_name``,
-``qmckl_python::register_error_codes`` and an empty
-``qmckl_python::register_generated`` (M3 fills it with the per-function
-bindings), and ``--pyi`` writes the hand-written ``_core.pyi`` surface.
+from the raw header text, and the M3 emission: ``--cpp`` writes the full
+C++ translation unit (the §5.7 error-code table plus one ``m.def`` per
+generated binding, PLAN.md §5.4), and ``--pyi`` writes the full ``_core.pyi``
+stub (the hand-written surface plus one ``def`` per generated binding,
+PLAN.md §5.6).
 
 Pipeline (PLAN.md §5.1):
   1. delete ``/* … */`` and ``//…`` comments;
@@ -28,9 +28,10 @@ declaration:
   scalar_out         (a) scalar out-parameter getters (explicit table, 18)
   array_no_size_max  (b) array outputs without size_max (explicit table, 4)
   handwritten        (c) bound by hand in csrc/module.cpp (§5.5(c), 7)
-  excluded           (d) not exposed at all (6)
-  trexio             (e) qmckl_trexio_read; codegen only when the linked
-                         library exports it (``--trexio`` / ``--no-trexio``)
+  excluded           (c) not exposed at all (§5.5(c), 7)
+  trexio             (d) qmckl_trexio_read; codegen only when the linked
+                         library exports it (§5.5(d), ``--trexio`` /
+                         ``--no-trexio``)
   generated          the ordinary shapes of §5.2/§5.3: everything else,
                      mechanically generated (sub-shapes: getter,
                      getter_transp, safe, other)
@@ -47,7 +48,14 @@ Hard failures (exit 1, per §5.1 "fail loudly, do not guess"):
   * a pointer parameter the role classifier cannot classify (unknown base
     type, pointer level >= 2, …);
   * a parameter or return type outside the §5.2 mapping tables;
-  * a Python keyword among the argument names after ``_`` suffixing.
+  * a Python keyword among the argument names after ``_`` suffixing;
+  * (emitters only) an argument ``python_name`` that is a C++ keyword, a
+    ``size_max`` whose declared type the emitter cannot cast to, or an
+    ``ABI_OVERRIDE_TABLE`` entry whose function is absent from the header,
+    whose names or arity drifted, whose type is outside the §5.2 mapping,
+    whose prototype matches the header (stale), or whose name is not
+    emitted (a silently rotting table reintroduces the bug, §5.5(e));
+  * (emitters only) a finished ``_core.pyi`` that ``ast.parse`` rejects.
 
 The §2 verified facts (239 declarations, 223 ``qmckl_exit_code`` returns, 125
 getter/setter-shape functions) are reported and warned about, not fatal: the
@@ -59,11 +67,36 @@ Usage:
   generate.py --header PATH/qmckl.h --dump-json OUT.json [--trexio|--no-trexio]
   generate.py --header PATH/qmckl.h --cpp OUT.cpp --pyi OUT.pyi [--trexio|--no-trexio]
 
-In M2, ``--cpp``/``--pyi`` emit the compilable skeleton of PLAN.md §10:
-the §5.7 error-code table (``code_name``, ``register_error_codes``) plus an
-empty ``register_generated`` / the hand-written stub surface.  M3 grows that
-skeleton into the per-function loop without changing the CLI, the file
-names, or the CMake integration.
+M3 grew the M2 skeleton (PLAN.md §10) into the per-function loop without
+changing the CLI, the file names, or the CMake integration.  ``--cpp`` emits
+one ``m.def`` per generated binding (de-duplicated by name, first occurrence
+wins, §5.1/§5.4); ``--pyi`` fills the ``BEGIN/END GENERATED BINDINGS``
+markers of ``_core.pyi`` and ``ast.parse``s the finished stub.
+
+On top of the §5.2 type mapping, the emitters consult one explicit table,
+applied to the emitted C++/stub only (the IR and ``--dump-json`` keep the
+header's truth):
+
+  * ``ABI_OVERRIDE_TABLE`` (§5.5(e)): ``qmckl_ao_gaussian_vgl`` and
+    ``qmckl_ao_slater_vgl`` — the installed header's prototypes are wrong
+    (§2): ``n``/``num_slater`` are declared ``const int64_t *`` but taken
+    by value by the bind(C) symbol, the gaussian's ``A`` is declared
+    ``const int64_t *`` but is ``const double *`` in the true prototype,
+    and both ``VGL`` are declared ``const double *`` but written by the
+    implementation (Fortran ``intent(out)``), so they are ``double *``.
+    The emitter builds a synthetic argument list from the table's true
+    prototype through the header's own type classifier and derives the
+    signature, the ``.pyi`` annotations and the call expression from it
+    by the ordinary §5.2–§5.4 rules (one code path, not two); the call
+    site uses a file-scope function pointer of the true prototype
+    (``reinterpret_cast``-initialised, not ``constexpr``: a
+    ``reinterpret_cast`` of a function pointer is not a constant
+    expression).
+
+The table is fatal in both directions: a function absent from the header,
+a drifted name or arity, a type outside the §5.2 mapping, a prototype
+that matches the header (stale), or an override for a name that is not
+emitted, exits 1, because a silently rotting table reintroduces the bug.
 
 Standard library only, Python >= 3.10.
 """
@@ -71,6 +104,7 @@ Standard library only, Python >= 3.10.
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import keyword
 import re
@@ -149,6 +183,19 @@ EXCLUDED_TABLE = (
     # returns "Unknown error" for every code.  qmckl.errors.error_name() is the
     # replacement (PLAN.md §2, §5.5(c)).
     "qmckl_string_of_error",
+    # Unusable as a Python API, three independent reasons (verified in
+    # src/qmckl_error.c, PLAN.md §5.5(c)): (1) it prints
+    # qmckl_string_of_error(rc) to stderr, which always says "Unknown
+    # error" on 1.1.0; (2) it passes a non-NUL-terminated, otherwise
+    # uninitialised char[QMCKL_MAX_MSG_LEN] to fprintf("%s", ...) — when
+    # the context carries no stored error, qmckl_get_error memcpy's zero
+    # bytes and the stack buffer is printed as-is (uninitialised read);
+    # (3) it passes its own rc argument as qmckl_get_error's exit_code
+    # OUT-parameter, so it can return QMCKL_SUCCESS for a non-zero rc —
+    # an error silently turned into success.  Every generated
+    # exit-code function already raises through qmckl::check (§6.1), so
+    # nothing in the package needs the C function.
+    "qmckl_check",
 )
 
 # (e) TREXIO-only: skipped entirely when the linked library does not export
@@ -190,6 +237,59 @@ BUCKET_ORDER = (
     "excluded",
     "trexio",
 )
+
+# §5.5(e) header/ABI divergence — the two functions whose installed
+# qmckl.h prototypes are wrong (§2).  The table carries their TRUE
+# bind(C) prototypes; the emitter builds a synthetic argument list from
+# them through the header's own type classifier and derives the
+# signature, the .pyi annotations and the call expression from it by
+# the ordinary §5.2–§5.4 rules (one code path, not two).  Applied to
+# the emitted C++/stub ONLY (the IR and --dump-json keep the header's
+# truth).  Checked fatal both ways by _check_emit_tables (emitters
+# only): name absent from the header, drifted names/arity, a type
+# outside the §5.2 mapping, a prototype that matches the header
+# (stale), or a name that is not emitted — a silently rotting table
+# reintroduces the bug.
+#
+# Do NOT add the _hpc variants: their VGL is already `double *` and
+# their other parameters match the header (verified in
+# src/qmckl_ao.c).  There is no gaussian _hpc variant.
+ABI_OVERRIDE_TABLE = {
+    "qmckl_ao_gaussian_vgl": (
+        ("context",      "qmckl_context"),
+        ("X",            "const double *"),
+        ("R",            "const double *"),
+        ("n",            "int64_t"),            # header: const int64_t *
+        ("A",            "const double *"),     # header: const int64_t *
+        ("VGL",          "double *"),           # header: const double *
+        ("ldv",          "int64_t"),
+    ),
+    "qmckl_ao_slater_vgl": (
+        ("context",      "qmckl_context"),
+        ("X",            "const double *"),
+        ("R",            "const double *"),
+        ("num_slater",   "int64_t"),            # header: const int64_t *
+        ("N",            "const int64_t *"),
+        ("A",            "const double *"),
+        ("VGL",          "double *"),           # header: const double *
+        ("ldv",          "int64_t"),
+    ),
+}
+
+# C++ keywords (C++17 plus the C++20 additions): the IR's python_name
+# becomes a C++ lambda parameter name, so none of these may occur.  Asserted
+# before emitting (PLAN.md §5.4 rule 1).
+CPP_KEYWORDS = frozenset("""
+    alignas alignvalof and asm auto bool break case catch char char8_t
+    char16_t char32_t class concept const consteval constexpr constinit
+    const_cast continue co_await co_return co_yield default delete do
+    double dynamic_cast else enum explicit export extern false float for
+    friend goto if inline int long mutable namespace new noexcept not
+    nullptr operator or private protected public register reinterpret_cast
+    requires return short signed sizeof static static_assert static_cast
+    struct switch template this thread_local throw true try typedef typeid
+    typename union unsigned using virtual void volatile wchar_t while
+""".split())
 
 # ---------------------------------------------------------------------------
 # Types
@@ -251,6 +351,7 @@ class Func:
     emitted: bool = True              # will produce a *generated* binding
     has_context: bool = False
     notes: list[str] = field(default_factory=list)
+    emit_args: Optional[list[Arg]] = None  # §5.5(e) synthetic list, cached
 
 
 # ---------------------------------------------------------------------------
@@ -373,7 +474,16 @@ def _parse_arg(func_name: str, arg_text: str) -> Arg:
             role, python_type = "context", "Context"
         else:
             role = "scalar"
-            python_type = _scalar_python(base)
+            # §5.2 maps no qmckl_exit_code parameter (the row is gone: on
+            # 1.1.0 the only five declarations with such a parameter —
+            # check, get_error, set_error, failwith, string_of_error —
+            # are all excluded, §5.5(c)).  python_type stays None, so an
+            # *emitted* declaration with one is unclassifiable and the
+            # run fails (classify); excluded ones are never validated.
+            if base == "qmckl_exit_code":
+                python_type = None
+            else:
+                python_type = _scalar_python(base)
     elif base == "char":
         # const char* is a string; bare char* is a single-character buffer.
         role = "string" if const_pointee else "char_out"
@@ -521,7 +631,7 @@ def _check_array_no_sizemax(func: Func) -> None:
 def _check_trexio(func: Func) -> None:
     roles = [a.role for a in func.args]
     if roles != ["context", "string", "size_max"]:
-        raise ParseError(f"{func.name}: §5.5(e) table entry but shape is {roles}")
+        raise ParseError(f"{func.name}: §5.5(d) table entry but shape is {roles}")
 
 
 def classify(functions: list[Func], trexio: bool) -> None:
@@ -710,9 +820,9 @@ def print_summary(functions: list[Func], trexio: bool) -> None:
     names = [f.name for f in functions]
     dups = {n: c for n, c in collections.Counter(names).items() if c > 1}
     rets = collections.Counter(f.return_type for f in functions)
-    print(f"qmckl.h declarations: {len(functions)} "
-          f"({len(set(names))} unique names"
-          + (f"; duplicates: {sorted(dups)}" if dups else "") + ")")
+    print(f"qmckl.h: declarations {len(functions)} | unique names "
+          f"{len(set(names))}"
+          + (f" | duplicates: {sorted(dups)}" if dups else ""))
     print("return types: " + " | ".join(f"{k} {v}" for k, v in rets.most_common()))
     print("buckets:")
     for b in BUCKET_ORDER:
@@ -736,41 +846,502 @@ def print_summary(functions: list[Func], trexio: bool) -> None:
     if n_exit != EXPECTED_EXIT_CODE_RETS:
         print(f"warning: {n_exit} qmckl_exit_code returns, "
               f"§2 verified fact is {EXPECTED_EXIT_CODE_RETS}", file=sys.stderr)
-    print(f"emitted (codegen): {sum(1 for f in functions if f.emitted)}"
+    emitted = [f for f in functions if f.emitted]
+    distinct = len({f.name for f in emitted})
+    print(f"emitted (codegen): {len(emitted)} declarations -> "
+          f"{distinct} distinct bindings"
           + ("" if trexio else " [trexio_read dropped: --no-trexio]"))
 
 
 # ---------------------------------------------------------------------------
-# Emitters (M2 skeleton; M3 grows them without touching the CLI, the file
-# names, or the CMake integration — PLAN.md §10)
+# Emitters (M3: per-function bindings — PLAN.md §5.4, §5.5(e), §5.6; the
+# CLI, the file names, and the CMake integration are untouched, §10)
 # ---------------------------------------------------------------------------
 
-def emit_cpp(codes: list[tuple[str, int]], header: str, path: Path) -> None:
-    """M2: emit the C++ translation unit (PLAN.md §5.7, §10).
+def _check_emit_tables(functions: list[Func]) -> None:
+    """Fatal both-ways check of ABI_OVERRIDE_TABLE (§5.5(e)).
+
+    Emitter path only (``--dump-json`` never runs it): the overrides
+    apply to the emitted C++/stub only, not to the IR.  Each of these
+    exits 1: a name absent from the header, a drifted arity, a
+    parameter name or order that differs, an override type outside the
+    §5.2 mapping, a prototype that matches the header (stale entry),
+    or a name that is not in an emitted bucket — a silently rotting
+    table reintroduces the bug.
+    """
+    by_name: dict[str, Func] = {}
+    for f in functions:
+        by_name.setdefault(f.name, f)
+    for fname, override in sorted(ABI_OVERRIDE_TABLE.items()):
+        f = by_name.get(fname)
+        if f is None:
+            raise ParseError(f"ABI override table: {fname} absent from the header")
+        if not f.emitted:
+            raise ParseError(f"ABI override table: {fname} is not in an "
+                             f"emitted bucket (bucket {f.bucket!r})")
+        if len(override) != len(f.args):
+            raise ParseError(f"ABI override table: {fname} has "
+                             f"{len(override)} override parameters, the "
+                             f"header has {len(f.args)}")
+        n_diff = 0
+        for a, (oname, otype) in zip(f.args, override):
+            if a.name != oname:
+                raise ParseError(f"ABI override table: {fname} parameter "
+                                 f"{oname!r} differs from the header's "
+                                 f"{a.name!r}; names and order must match")
+            s = _parse_arg(fname, f"{otype} {oname}")
+            if s.python_type is None and s.role not in ("size_max", "context"):
+                raise ParseError(f"ABI override table: {fname}({oname}) type "
+                                 f"{otype!r} is outside the §5.2 mapping")
+            # Same parameter type = same base, pointer level and
+            # pointee const-ness: a level-0 const (the header writes
+            # "const qmckl_context") and a const on the pointer itself
+            # are not part of the ABI.
+            if (s.base, s.pointer_level, s.is_const_pointee) != \
+                    (a.base, a.pointer_level, a.is_const_pointee):
+                n_diff += 1
+        if n_diff == 0:
+            raise ParseError(f"ABI override table: {fname} matches the "
+                             f"header exactly; the entry is stale")
+
+
+def _override_args(f: Func) -> list[Arg]:
+    """The synthetic argument list of an ABI_OVERRIDE_TABLE entry: the
+    override's types run through the header's own type classifier
+    (``_parse_arg``), so there is no second type mapping (§5.2,
+    §5.5(e)).  A size_max position inherits the IR's size_rule/
+    size_target, so §5.3 and §5.4 rule 2 apply unchanged.  Name and
+    order identity with the header is guaranteed by
+    _check_emit_tables."""
+    args: list[Arg] = []
+    for a, (oname, otype) in zip(f.args, ABI_OVERRIDE_TABLE[f.name]):
+        s = _parse_arg(f.name, f"{otype} {oname}")
+        if a.role == "size_max":
+            s.size_rule = a.size_rule
+            s.size_target = a.size_target
+        args.append(s)
+    return args
+
+
+def _emit_args(f: Func) -> list[Arg]:
+    """The argument list the emitters (and the pre-emit assertions)
+    read for ``f``: the synthetic override list for ABI_OVERRIDE_TABLE
+    entries, the IR's args otherwise.  Everything downstream —
+    python_name, scalar vs array, dtype, const-ness, writability,
+    ``nb::arg``, the ``.pyi`` annotations and the call expression —
+    follows the ordinary §5.2–§5.4 rules from this list: one code
+    path, not two (§5.5(e)).
+    """
+    if f.name in ABI_OVERRIDE_TABLE:
+        if f.emit_args is None:
+            f.emit_args = _override_args(f)
+        return f.emit_args
+    return f.args
+
+
+def _abi_override_lines(functions: list[Func]) -> list[str]:
+    """File-scope function pointers of the true bind(C) prototypes of
+    the ABI_OVERRIDE_TABLE entries (§5.5(e)), emitted once per
+    overridden name after de-duplication, inside an anonymous
+    namespace.
+
+    The installed header's own prototype cannot be used to make the
+    call: the C++ compiler enforces it, and it is wrong (§2).  The
+    pointer is deliberately not constexpr: a reinterpret_cast of a
+    function pointer is not a constant expression.  If a compiler
+    warns -Wcast-function-type, replace this with a std::memcpy
+    bit-copy of the function pointer instead of suppressing the
+    warning (M3 acceptance: zero warnings outside nanobind).
+    """
+    L: list[str] = []
+    for f in _emitted_functions(functions):
+        if f.name not in ABI_OVERRIDE_TABLE:
+            continue
+        L.append(f"// {f.name}: the installed qmckl.h prototype is wrong")
+        L.append("// (§2, §5.5(e)); the call goes through this function")
+        L.append("// pointer of the true bind(C) prototype")
+        L.append("// (src/qmckl_ao_f.F90, _install/include/qmckl_f.F90).")
+        L.extend(_abi_using_lines(f))
+        L.append(f"{f.name}_abi_t const {f.name}_abi =")
+        L.append(f"    reinterpret_cast<{f.name}_abi_t>(&::{f.name});")
+        L.append("")
+    if L:
+        L.pop()  # trailing blank line
+    return L
+
+
+def _abi_using_lines(f: Func) -> list[str]:
+    types = [t for _, t in ABI_OVERRIDE_TABLE[f.name]]
+    one = f"using {f.name}_abi_t = qmckl_exit_code (*)({', '.join(types)});"
+    if len(one) <= 88:
+        return [one]
+    lines = [f"using {f.name}_abi_t = qmckl_exit_code (*)("]
+    inner = "    "
+    cur = ""
+    for t in types:
+        piece = t if not cur else ", " + t
+        if cur and len(inner + cur + piece) > 88:
+            lines.append(inner + cur + ",")
+            cur = t
+        else:
+            cur += piece
+    lines.append(inner + cur + ");")
+    return lines
+
+
+def _call_head(f: Func) -> str:
+    """The head of the emitted C call.  ABI_OVERRIDE_TABLE entries are
+    called through the true-prototype function pointer (see
+    _abi_override_lines); everything else through the header's
+    prototype."""
+    if f.name in ABI_OVERRIDE_TABLE:
+        return f"{f.name}_abi("
+    return f"::{f.name}("
+
+
+def _assert_emit_names(functions: list[Func], trexio: bool) -> None:
+    """Pre-emit assertions of PLAN.md §5.4 rule 1.
+
+    Every argument ``python_name`` becomes an ``nb::arg`` name (a keyword
+    name, echoed by the stub) and a C++ lambda parameter name: none may be
+    a Python keyword or a C++ keyword, and none may repeat inside a
+    function.
+    """
+    for f in functions:
+        for a in _emit_args(f):
+            if keyword.iskeyword(a.python_name):
+                raise ParseError(f"{f.name}: argument python_name "
+                                 f"{a.python_name!r} is a Python keyword")
+            if a.python_name in CPP_KEYWORDS:
+                raise ParseError(f"{f.name}: argument python_name "
+                                 f"{a.python_name!r} is a C++ keyword")
+        names = [a.python_name for a in _emit_args(f)]
+        if len(set(names)) != len(names):
+            raise ParseError(f"{f.name}: duplicate python_name among arguments")
+    for f in functions:
+        if f.bucket == "trexio" and f.emitted != trexio:
+            raise ParseError(f"{f.name}: trexio bucket's emitted flag "
+                             f"inconsistent with --trexio/--no-trexio")
+
+
+def _emitted_functions(functions: list[Func]) -> list[Func]:
+    """The declarations that produce a generated binding, in header order,
+    de-duplicated by name, first occurrence wins (§5.1, §5.4 rule 5)."""
+    seen: set[str] = set()
+    out: list[Func] = []
+    for f in functions:
+        if not f.emitted or f.name in seen:
+            continue
+        seen.add(f.name)
+        out.append(f)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# §5.2 / §5.4 / §5.6 per-argument descriptors, shared by both emitters
+# (§5.4 rule 7: one descriptor, two emitters — the signature cannot drift).
+# ---------------------------------------------------------------------------
+
+# §5.6 stub array element type, from the pointee base type.
+_ARRAY_NP = {
+    "double": "float64",
+    "float": "float32",
+    "int64_t": "int64",
+    "int32_t": "int32",
+    "int": "int32",
+    "size_t": "int64",
+    "ssize_t": "int64",
+    "uint8_t": "uint8",
+    "uint16_t": "uint16",
+    "uint32_t": "uint32",
+    "uint64_t": "uint64",
+}
+
+
+def _scalar_cpp(base: str) -> str:
+    """§5.2 C lambda parameter type for a scalar argument."""
+    return "bool" if base == "_Bool" else base
+
+
+def _array_cpp(fname: str, a: Arg) -> str:
+    """§5.2 C lambda parameter type for an array argument.  Const-ness
+    (and hence writability) comes from the arg's role, which for
+    ABI_OVERRIDE_TABLE entries derives from the override's types."""
+    const = "const " if a.role == "in_array" else ""
+    return f"nb::ndarray<{const}{a.base}, nb::c_contig>"
+
+
+def _array_stub(a: Arg) -> str:
+    """§5.6 stub annotation for an array argument (const or not)."""
+    if a.base not in _ARRAY_NP:
+        raise ParseError(f"unmapped array element type {a.base!r}")
+    return f"NDArray[np.{_ARRAY_NP[a.base]}]"
+
+
+def _return_class(f: Func) -> tuple[str, str]:
+    """§5.4 rule 4 return class — exactly one of four:
+
+    - 'exit' (``qmckl_exit_code``): raise on non-zero via ``check()``;
+    - 'value': call and return the C value, no ``check()``;
+    - 'scalar_out' (§5.5(a)): pass ``&qmckl_value``, check, return it;
+    with the C type of the returned value (the pointee type for
+    scalar_out).  Anything else is a generator bug.
+    """
+    if f.bucket == "scalar_out":
+        p = next(a for a in f.args if a.role == "out_array")
+        return "scalar_out", _scalar_cpp(p.base)
+    rt = f.return_type
+    if rt == "qmckl_exit_code":
+        return "exit", ""
+    if rt in INT_BASES or rt in FLOAT_BASES or rt in ("_Bool", "bool"):
+        return "value", _scalar_cpp(rt)
+    raise ParseError(f"{f.name}: no §5.4 return class for return type {rt!r}")
+
+
+def _size_cast_type(c_type: str) -> str:
+    """§5.4 rule 2: the cast target is the declared C type of the size_max
+    parameter — ``static_cast<int64_t>`` everywhere except ``int64_t const``
+    in ``qmckl_get_jastrow_champ_ee_distance_rescaled`` and ``const size_t``
+    in ``qmckl_get_en_rescaled_single_gl``: those two header spellings are
+    kept verbatim, only the canonical leading-const spelling of the usual
+    case (``const int64_t``) is normalised to ``int64_t``."""
+    if c_type == "const int64_t":
+        return "int64_t"
+    return c_type
+
+
+def _size_expr(f: Func, a: Arg) -> str:
+    """The inlined value of a dropped size_max parameter (§5.3, §5.4 rule
+    2): the size_target's ``.size()``, or ``std::strlen`` for the trexio
+    string, cast to the size_max parameter's declared type.  Never from
+    Python, never derived from lda/ldc."""
+    if a.size_rule == "strlen":
+        inner = f"std::strlen({a.size_target}.c_str())"
+    elif a.size_rule in ("bare", "sized"):
+        target = next((x for x in _emit_args(f)
+                      if x.name == a.size_target), None)
+        if target is None:
+            raise ParseError(f"{f.name}: size_target {a.size_target!r} of "
+                             f"size_max {a.name!r} not found among arguments")
+        inner = f"{target.python_name}.size()"
+    else:
+        raise ParseError(f"{f.name}: size_max {a.name!r} has unknown "
+                         f"size_rule {a.size_rule!r}")
+    return f"static_cast<{_size_cast_type(a.c_type)}>({inner})"
+
+
+def _c_call_exprs(f: Func) -> list[str]:
+    """The C call's argument expressions, in the descriptor's order, with
+    the size_max positions inlined (§5.4).  For ABI_OVERRIDE_TABLE
+    entries the descriptor is the override's synthetic list, and the
+    call head (see _call_head) goes through the true-prototype pointer."""
+    exprs: list[str] = []
+    for a in _emit_args(f):
+        if a.role == "context":
+            exprs.append("ctx.h")
+        elif a.role == "string":
+            exprs.append(f"{a.python_name}.c_str()")
+        elif a.role == "size_max":
+            exprs.append(_size_expr(f, a))
+        elif a.role in ("in_array", "out_array"):
+            if f.bucket == "scalar_out":
+                exprs.append("&qmckl_value")
+            else:
+                exprs.append(f"{a.python_name}.data()")
+        elif a.role == "scalar":
+            exprs.append(a.python_name)
+        else:
+            raise ParseError(f"{f.name}: unemittable argument {a.name!r} "
+                             f"(role {a.role!r})")
+    return exprs
+
+
+def _lambda_params(f: Func) -> list[str]:
+    """The C lambda parameters: the Python signature (C order minus every
+    size_max, minus the scalar_out buffer) with §5.2 types."""
+    params: list[str] = []
+    if f.has_context:
+        params.append("qmckl::Context &ctx")
+    for a in _emit_args(f):
+        if a.role in ("context", "size_max"):
+            continue
+        if f.bucket == "scalar_out" and a.role == "out_array":
+            continue
+        if a.role == "string":
+            t = "std::string"
+        elif a.role in ("in_array", "out_array"):
+            t = _array_cpp(f.name, a)
+        else:
+            t = _scalar_cpp(a.base)
+        params.append(f"{t} {a.python_name}")
+    return params
+
+
+def _arg_descriptors(f: Func) -> list[str]:
+    """The trailing ``nb::arg`` descriptors (§5.4 rules 1 and 3): every
+    parameter keeps its python_name; ``.noconvert()`` on ``nb::ndarray``
+    arguments only — scalars keep nanobind's default conversion."""
+    descs: list[str] = []
+    for a in _emit_args(f):
+        if a.role == "size_max":
+            continue
+        if f.bucket == "scalar_out" and a.role == "out_array":
+            continue
+        d = f'"{a.python_name}"_a'
+        if a.role in ("in_array", "out_array"):
+            d += ".noconvert()"
+        descs.append(d)
+    return descs
+
+
+def _wrapped(indent: str, head: str, items: list[str], close: str) -> list[str]:
+    """`head<item, item, …close>` on one line when it fits in 88 columns.
+
+    Otherwise the head stays alone on the first line (the §5.4 template
+    shape) and the items wrap at indent+4, the closing token on the last
+    item's line.  With an empty head (the nb::arg descriptor list) the items
+    wrap at indent itself.
+    """
+    one = f"{indent}{head}{', '.join(items)}{close}"
+    if len(one) <= 88:
+        return [one]
+    lines: list[str] = []
+    base = indent
+    if head:
+        lines.append(f"{indent}{head}")
+        base = indent + "    "
+    cur = ""
+    for e in items:
+        piece = e if not cur else ", " + e
+        if cur and len(base + cur + piece) > 88:
+            lines.append(base + cur + ",")
+            cur = e
+        else:
+            cur += piece
+    lines.append(base + cur + close)
+    return lines
+
+
+def _mdef_lines(f: Func) -> list[str]:
+    """One m.def per binding: the §5.4 template shape, with the four return
+    classes of rule 4.  The only local is ``qmckl_rc`` (plus ``qmckl_value``
+    in the value and scalar_out classes, as shown in §5.4's scalar-out
+    template); the GIL is released only around the C call."""
+    rclass, value_type = _return_class(f)
+    indent = " " * 14
+    exprs = _c_call_exprs(f)
+    body: list[str] = []
+    if rclass in ("exit", "scalar_out"):
+        if rclass == "scalar_out":
+            body.append(f"{indent}{value_type} qmckl_value{{}};")
+        body.append(f"{indent}qmckl_exit_code qmckl_rc;")
+        body.append(f"{indent}{{")
+        body.append(f"{indent}    nb::gil_scoped_release nogil;")
+        body.extend(_wrapped(indent + "    ", f"qmckl_rc = {_call_head(f)}",
+                             exprs, ");"))
+        body.append(f"{indent}}}")
+        # The no-context branch exists so a future header cannot produce an
+        # unchecked call; check() skips the qmckl_get_error read for a NULL
+        # context (§6.1).  No such function exists on 1.1.0.
+        ctx = "ctx.h" if f.has_context else "QMCKL_NULL_CONTEXT"
+        body.append(f'{indent}qmckl::check({ctx}, qmckl_rc, "{f.name}");')
+        if rclass == "scalar_out":
+            body.append(f"{indent}return qmckl_value;")
+    else:  # "value": call and return the C value, no check()
+        body.append(f"{indent}{value_type} qmckl_value{{}};")
+        body.append(f"{indent}{{")
+        body.append(f"{indent}    nb::gil_scoped_release nogil;")
+        body.extend(_wrapped(indent + "    ", f"qmckl_value = {_call_head(f)}",
+                             exprs, ");"))
+        body.append(f"{indent}}}")
+        body.append(f"{indent}return qmckl_value;")
+
+    params = _lambda_params(f)
+    lines = [f'    m.def("{f.python_name}",']
+    if len(params) == 1:
+        lines.append(f"          []({params[0]}) {{")
+    else:
+        lines.append(f"          []({params[0]},")
+        for p in params[1:-1]:
+            lines.append(f"            {p},")
+        lines.append(f"            {params[-1]}) {{")
+    lines.extend(body)
+    lines.append("          },")
+    lines.extend(_wrapped("          ", "", _arg_descriptors(f), ");"))
+    return lines
+
+
+def _pyi_def_line(f: Func) -> str:
+    """§5.6: one stub def per binding — same name, order and keyword names
+    as ``register_generated``, after the same de-duplication.  Context
+    first; every parameter positional-or-keyword."""
+    rclass, _ = _return_class(f)
+    ps: list[str] = []
+    for a in _emit_args(f):
+        if a.role == "size_max":
+            continue
+        if f.bucket == "scalar_out" and a.role == "out_array":
+            continue
+        if a.role == "context":
+            t = "_Context"
+        elif a.role in ("in_array", "out_array"):
+            t = _array_stub(a)
+        else:
+            t = _scalar_python(a.base)
+        ps.append(f"{a.python_name}: {t}")
+    if rclass == "exit":
+        ret = "None"  # raise on non-zero (§5.2)
+    elif rclass == "value":
+        ret = f.return_python
+    else:  # scalar_out: the pointee type (§5.2 return mapping)
+        ret = _scalar_python(next(a for a in f.args
+                                   if a.role == "out_array").base)
+    return f"def {f.python_name}({', '.join(ps)}) -> {ret}: ..."
+
+
+def emit_cpp(functions: list[Func], trexio: bool,
+             codes: list[tuple[str, int]], header: str, path: Path) -> None:
+    """M3: emit the full C++ translation unit (PLAN.md §5.4, §5.5, §5.7).
 
     Contains ``qmckl::code_name`` (a switch over the bare integer values,
     so the generated file does not depend on macros a future header could
     rename), ``qmckl_python::register_error_codes`` (the ``ERROR_CODES``
-    dict of the extension) and an empty ``register_generated`` that M3
-    fills with the per-function bindings.
+    dict of the extension) and one ``m.def`` per generated binding inside
+    ``qmckl_python::register_generated`` (§5.4).  With ``--no-trexio`` the
+    ``qmckl_trexio_read`` binding is not emitted at all (§5.5(d)).
     """
+    _assert_emit_names(functions, trexio)
+    _check_emit_tables(functions)
     L: list[str] = []
     a = L.append
     a("// generated_bindings.cpp")
     a("//")
     a(f"// Generated by csrc/generate.py from {header} -- DO NOT EDIT.")
     a("//")
-    a("// Milestone M2 (PLAN.md §5.7, §10): the error-code table read from")
-    a("// the QMCKL_* macros of the installed header, plus the empty")
-    a("// register_generated() that M3 fills with the per-function bindings.")
+    a("// Milestone M3 (PLAN.md §5.4, §5.5, §5.7): the error-code table read")
+    a("// from the QMCKL_* macros of the installed header, plus one m.def")
+    a("// per generated binding (de-duplicated by name, first occurrence")
+    a(f"// wins); the TREXIO binding is {'emitted' if trexio else 'skipped'}.")
     a("")
     a("#include <nanobind/nanobind.h>")
+    a("#include <nanobind/ndarray.h>")
+    a("#include <nanobind/stl/string.h>")
+    a("#include <cstring>")
     a("")
     a('#include "context.hpp"')
     a("")
     a("// nanobind 3.x renamed its namespace from `nb` to `nanobind`.")
     a("namespace nb = nanobind;")
+    a("using namespace nb::literals;")
     a("")
+    abi_lines = _abi_override_lines(functions)
+    if abi_lines:
+        a("namespace {")
+        a("")
+        L.extend(abi_lines)
+        a("")
+        a("}  // namespace")
+        a("")
     a("namespace qmckl {")
     a("")
     a("const char *code_name(int32_t rc) {")
@@ -787,9 +1358,15 @@ def emit_cpp(codes: list[tuple[str, int]], header: str, path: Path) -> None:
     a("")
     a("namespace qmckl_python {")
     a("")
-    a("// M2: no per-function bindings yet; M3 emits one m.def per")
-    a("// generated symbol here (PLAN.md §5.4).")
-    a("void register_generated(nb::module_ &m) { (void) m; }")
+    emitted = _emitted_functions(functions)
+    if emitted:
+        a("void register_generated(nb::module_ &m) {")
+        for f in emitted:
+            L.extend(_mdef_lines(f))
+            a("")
+        a("}")
+    else:  # never happens on a >= 1.1 header; keeps the TU warning-free
+        a("void register_generated(nb::module_ &m) { (void) m; }")
     a("")
     a("void register_error_codes(nb::module_ &m) {")
     a("    nb::dict codes;")
@@ -802,18 +1379,25 @@ def emit_cpp(codes: list[tuple[str, int]], header: str, path: Path) -> None:
     path.write_text("\n".join(L) + "\n", encoding="utf-8")
 
 
-def emit_pyi(header: str, path: Path) -> None:
-    """M2: emit the _core.pyi stub (PLAN.md §5.6).
+def emit_pyi(functions: list[Func], trexio: bool, header: str, path: Path) -> None:
+    """M3: emit the _core.pyi stub (PLAN.md §5.6).
 
-    The hand-written surface only.  M3 inserts the per-function defs
-    between the BEGIN/END GENERATED BINDINGS markers.
+    The emitter owns the whole file: the hand-written surface plus one def
+    per generated binding between the ``BEGIN/END GENERATED BINDINGS``
+    markers (with the imports the annotations need).  The emitter runs
+    ``ast.parse()`` on the finished text and exits 1 when the stub is not
+    valid Python: an unparsable stub silently degrades every annotation to
+    ``Any``, which is worse than a failed build.
     """
+    _assert_emit_names(functions, trexio)
+    _check_emit_tables(functions)
     L: list[str] = []
     a = L.append
     a(f"# _core.pyi -- generated by csrc/generate.py from {header} -- DO NOT EDIT.")
     a("#")
-    a("# Milestone M2 (PLAN.md §5.6): the hand-written surface of the")
-    a("# qmckl._core extension.  The module exposes nothing else at top level.")
+    a("# Milestone M3 (PLAN.md §5.6): the hand-written surface of the")
+    a("# qmckl._core extension, plus one def per generated binding.")
+    a("# The module exposes nothing else at top level.")
     a("")
     a("ERROR_CODES: dict[str, int]")
     a("")
@@ -836,8 +1420,20 @@ def emit_pyi(header: str, path: Path) -> None:
     a("")
     a("")
     a("# BEGIN GENERATED BINDINGS (M3 inserts one def per generated symbol)")
+    a("import numpy as np")
+    a("from numpy.typing import NDArray")
+    a("")
+    a("")
+    for f in _emitted_functions(functions):
+        a(_pyi_def_line(f))
+        a("")
     a("# END GENERATED BINDINGS")
-    path.write_text("\n".join(L) + "\n", encoding="utf-8")
+    text = "\n".join(L) + "\n"
+    try:
+        ast.parse(text)
+    except SyntaxError as e:
+        raise ParseError(f"generated _core.pyi is not valid Python: {e}")
+    path.write_text(text, encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -852,11 +1448,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--header", required=True, metavar="PATH/qmckl.h",
                    help="installed qmckl.h to parse")
     p.add_argument("--cpp", metavar="OUT.cpp",
-                   help="C++ emitter output (§5.7 error table + "
-                        "register_generated; empty binding set in M2)")
+                   help="C++ emitter output (§5.7 error table + one m.def "
+                        "per generated binding, §5.4)")
     p.add_argument("--pyi", metavar="OUT.pyi",
-                   help="stub emitter output (the hand-written §5.6 surface "
-                        "in M2)")
+                   help="stub emitter output (§5.6: the hand-written surface "
+                        "plus one def per generated binding)")
     g = p.add_mutually_exclusive_group()
     g.add_argument("--trexio", dest="trexio", action="store_true", default=True,
                    help="the linked library exports qmckl_trexio_read (default)")
@@ -897,9 +1493,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         Path(args.dump_json).write_text(
             to_json(functions, args.trexio, args.header) + "\n", encoding="utf-8")
     if args.cpp:
-        emit_cpp(codes, args.header, Path(args.cpp))
+        emit_cpp(functions, args.trexio, codes, args.header, Path(args.cpp))
     if args.pyi:
-        emit_pyi(args.header, Path(args.pyi))
+        emit_pyi(functions, args.trexio, args.header, Path(args.pyi))
     return 0
 
 
