@@ -95,6 +95,43 @@ garbage-collected (no `close()` is needed, and `with` only calls
 `qmckl_context_touch` on exit). `Context.copy()` performs a `qmckl_context_copy`
 deep copy; the two contexts are then fully independent.
 
+Integer properties (thin wrappers over the scalar getters): `elec_num`,
+`nucl_num`, `point_num`, `walk_num`, `ao_num`, `mo_num`, `prim_num`,
+`shell_num`.
+
+Array properties:
+
+| attribute | shape | settable |
+|---|---|---|
+| `point` | `(point_num, 3)` | yes |
+| `nucl_coord` | `(nucl_num, 3)` | yes |
+| `electron_coord` | `(walk_num, elec_num, 3)` | yes |
+| `ao_value` | `(point_num, ao_num)` | no |
+| `ao_vgl` | `(point_num, 5, ao_num)` | no |
+| `mo_value` | `(point_num, mo_num)` | no |
+| `mo_vgl` | `(point_num, 5, mo_num)` | no |
+| `ee_distance` | `(walk_num, elec_num, elec_num)` | no |
+| `en_distance` | `(point_num, nucl_num)` | no |
+| `ee_potential` | `(walk_num,)` | no |
+| `en_potential` | `(walk_num,)` | no |
+
+Setters accept any array-like, convert it to a C-contiguous `float64` array,
+and raise `ValueError` on a wrong shape; the `'N'` layout is used (the `'T'`
+layout stays in the raw layer only).  `Context.trexio_read(path)` loads a
+TREXIO file into the context and raises `NotImplementedError` on a build
+without TREXIO.
+
+## Row-major BLAS
+
+`qmckl.dgemm(ctx, A, B, transa="N", transb="N", alpha=1.0)` computes
+`alpha * op(A) @ op(B)` on ordinary row-major NumPy arrays and returns a new
+C-contiguous `(m, n)` array; `op(X)` is `X` for `"N"` and `X.T` for `"T"`.
+It packs the column-major buffers `qmckl_dgemm_safe` expects, so `lda`/`ldb`/
+`ldc` are never user-visible, and it raises `ValueError` on a shape mismatch,
+a bad flag, or a zero dimension. It shadows the generated `_core.dgemm`; the
+raw column-major functions remain available as `qmckl._core.dgemm` and
+`qmckl._core.dgemm_safe`.
+
 ## Traps
 
 1. **Version coupling.** The bindings are generated from the installed
@@ -112,6 +149,16 @@ deep copy; the two contexts are then fully independent.
    is released, so NumPy/threading concurrency works.
 6. `qmckl_string_of_error` is broken in the QMCkl 1.1.0 release tarball (empty
    switch, always "Unknown error"). This package carries its own code table.
+7. **The two potential getters carry no `size_max`**
+   (`qmckl_get_electron_ee_potential`, `qmckl_get_electron_en_potential`).
+   The raw layer cannot check the buffer it is given; use the
+   `Context.ee_potential` / `en_potential` properties, which allocate it.
+8. **Zero points.** The four point-evaluated properties (`ao_value`, `ao_vgl`,
+   `mo_value`, `mo_vgl`) refuse an empty point set with `ValueError`: with
+   `point_num == 0` the provider allocates zero bytes, QMCkl 1.1.0 records
+   that as a free slot, the next allocation overwrites the record, and the
+   context's allocation counter never returns to zero.  An assert-enabled
+   `qmckl_context_destroy` then aborts.
 
 ## Development
 

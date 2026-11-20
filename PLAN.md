@@ -773,6 +773,7 @@ from . import _core
 from ._core import *              # generated functions, QMCKLStatusError, ERROR_CODES
 from .context import Context
 from .errors import ERROR_CODES, error_name
+from .blas import dgemm
 
 # One source of truth: every public name of the extension, plus the Pythonic
 # layer. `import *` skips `_Context` (leading underscore), which is intended:
@@ -784,14 +785,19 @@ __all__ = sorted({"Context", "error_name"}
 `Context` subclasses `_core._Context`; generated functions accept it because the
 parameter type is `qmckl::Context &`.
 
+`dgemm` is the row-major wrapper of §7.2b; it deliberately shadows the
+generated `_core.dgemm`, which is already a public name of `_core`, so
+`__all__` is unchanged and the raw column-major calls remain at
+`qmckl._core.dgemm` / `qmckl._core.dgemm_safe`.
+
 The package ships an empty `src/qmckl/py.typed` (PEP 561). Without it, type
 checkers ignore the installed `_core.pyi` and every generated function is
 `Any`. `wheel.packages = ["src/qmckl"]` picks it up automatically.
 
 ### 7.2 `src/qmckl/context.py`
 
-M2 ships this file with exactly the class below (plus nothing else); M4 adds
-the properties and setters, in this same file.
+The class below, plus the properties and setters of this section.  Shapes are
+validated here, because the raw layer cannot validate them (§11, trap 3).
 
 ```python
 class Context(_core._Context):
@@ -800,6 +806,8 @@ class Context(_core._Context):
 
     def __enter__(self): return self
     def __exit__(self, *exc): self.touch()            # GC owns destruction
+
+    def trexio_read(self, path): ...                  # see below
 ```
 
 Integers (thin wrappers over the scalar-out getters):
@@ -831,18 +839,40 @@ def _get(self, getter, shape):
     getter(self, buf)
     return buf
 
-mo_value = property(lambda self: self._get(
-    _core.get_mo_basis_mo_value, (self.point_num, self.mo_num)))
+def _eval(self, getter, shape):
+    if shape[0] == 0:
+        raise ValueError("no points in the context: set ctx.point (or "
+                         "ctx.electron_coord) before evaluating the basis")
+    return self._get(getter, shape)
 ```
 
-Setters: `set_point(coords)` derives `num = coords.shape[0]` and passes
-`transp='N'` (verified: `qmckl_get_point`/`qmckl_set_point` with `'N'` are the
-`(num, 3)` row-major layouts — internally QMCkl stores a 3×num matrix and
-transposes for `'N'`); `set_nucleus_coord`, `set_electron_coord` likewise. The
-`'T'` layout stays available in the raw layer only.
+`_eval` is used by the four point-evaluated properties (`ao_value`, `ao_vgl`,
+`mo_value`, `mo_vgl`) and refuses `point_num == 0`: with no points the
+provider allocates zero bytes, which corrupts QMCkl 1.1.0's allocation
+bookkeeping and makes an assert-enabled `qmckl_context_destroy` abort (§11,
+trap 9).  Every other array property uses `_get` directly.
 
-`trexio_read(path)` → `_core.trexio_read(self, str(path))`; raise
-`NotImplementedError` when the symbol is absent (checked once at import).
+Setters: each coordinate setter runs the input through `_coords(x, ndim)` —
+`np.ascontiguousarray(x, dtype=np.float64)` plus a rank and last-axis-3 check,
+`ValueError` otherwise — and passes `transp='N'` (verified:
+`qmckl_get_point`/`qmckl_set_point` with `'N'` are the `(num, 3)` row-major
+layouts — internally QMCkl stores a 3×num matrix and transposes for `'N'`;
+the `'T'` layout stays available in the raw layer only).
+
+- `point` — `num = coords.shape[0]` → `set_point(ctx, 'N', num, coords)`.
+- `nucl_coord` — derives `n = coords.shape[0]`; calls
+  `qmckl_set_nucleus_num(ctx, n)` only when `qmckl_get_nucleus_num` reports
+  `QMCKL_NOT_PROVIDED` (a fresh context), and raises `ValueError` when the
+  stored count differs from `n` — `qmckl_set_nucleus_coord` takes no num and
+  would truncate silently otherwise.
+- `electron_coord` — requires `elec_num` to be set and `shape[1] == elec_num`
+  (else `ValueError`).  Note that `qmckl_set_electron_coord` calls
+  `qmckl_set_point`, so it **replaces the point set**: afterwards
+  `point_num == walk_num * elec_num`.
+
+`trexio_read(path)` is a method that calls `_core.trexio_read(self, str(path))`
+and raises `NotImplementedError` when `_core.trexio_read` is absent (checked
+once at import, §5.5(d)).
 
 Shapes above are verified against the getters' `size_max` checks and the org
 argument tables in `org/qmckl_*.org` of the QMCkl sources.
@@ -860,7 +890,15 @@ def dgemm(ctx, A, B, *, transa="N", transb="N", alpha=1.0):
 ```
 
 - `op(X)` is `X` for `"N"` and `X.T` for `"T"`; `opA` is `(m, k)`, `opB` is
-  `(k, n)`, the result is `(m, n)`. A shape mismatch raises `ValueError`.
+  `(k, n)`, the result is `(m, n)`. A shape mismatch raises `ValueError`, and
+  so does a flag other than `'N'`/`'T'` (either case is accepted).
+  `m`, `n` or `k` equal to zero also raises `ValueError`: a zero-row NumPy
+  matmul is legal, but `qmckl_dgemm_safe` rejects non-positive dimensions
+  with `QMCKL_INVALID_ARG_*`.
+- `qmckl.dgemm` shadows the generated `_core.dgemm`, which is already a
+  public name of `_core`; `__all__` is therefore unchanged, and the raw
+  column-major calls remain at `qmckl._core.dgemm` /
+  `qmckl._core.dgemm_safe`.
 - Column-major buffers, packed (`ld` = number of rows of the stored matrix):
   `bufA = np.ascontiguousarray(opA.T)` is `(k, m)` with `lda = m`,
   `bufB = np.ascontiguousarray(opB.T)` is `(n, k)` with `ldb = k`, and
@@ -906,12 +944,12 @@ single source of truth. `ERROR_CODES` covers `QMCKL_SUCCESS`,
 |---|---|
 | `test_surface.py` | **M3**: every top-level name of `_core.pyi` is in `dir(_core)`; the number of generated `def`s in the stub equals the number of generated names in `dir(_core)` and is ≥ 220 (223 with TREXIO, 222 without); `get_mo_basis_mo_value`, `dgemm_safe`, `test_precision_64`, `get_point_num`, `ao_gaussian_vgl` present; `trexio_read` present exactly when the library exports it; `string_of_error`, `get_error`, `check`, `failwith`, `lock` **absent** (deliberate, §5.5c); `_Context` and `ERROR_CODES` present; `qmckl.__all__` equals the public names |
 | `test_generated.py` | **M3**: `test_precision_64(1.0, 1.0) >= 53`; `dgemm_safe` is a **faithful column-major passthrough** (§5.4 rule 7) for one non-square and one square shape in all four `transa`/`transb` (arrays, `size_max`, `char` args, GIL release): given row-major `A` of shape `(k, m)` when `transa='T'` and `(m, k)` otherwise, buffers are `bufA = np.ascontiguousarray(A.T)`, `bufB = np.ascontiguousarray(B.T)`, `bufC = np.zeros((n, m))`, leading dimensions `bufA.shape[1]`, `bufB.shape[1]`, `m`, expected `bufC.T == op(A) @ op(B)`; payloads are `[[1,2],[3,4],[5,6]]`-class values so that a transposed reading cannot pass. `get_point_num` on a fresh context returns `0` — its C body has no `NOT_PROVIDED` check, it just copies `point.num` — while `get_ao_basis_shell_num`, also scalar-out, raises `QMCKLStatusError` starting `[QMCKL_NOT_PROVIDED]`; `ao_gaussian_vgl` with `A = np.array([1.0, 2.0])`, `X = (0.5,0,0)`, `R = 0` gives the documented values `VGL[0,0] = exp(-0.25)`, `VGL[0,1] = exp(-0.5)`, `VGL[1,0] = -exp(-0.25)`, and the Laplacians `VGL[4,0] = (4*1**2*0.25 - 6*1)*exp(-0.25) = -5*exp(-0.25)`, `VGL[4,1] = (4*2**2*0.25 - 6*2)*exp(-0.5) = -8*exp(-0.5)`, in a C-contiguous `np.zeros((5, ldv))` whose flat memory is exactly the Fortran `VGL(ldv,5)` column-major layout — this fails if `A` is bound as an integer array (§5.5e). Write the Laplacian as `(4*alpha**2*r2 - 6*alpha)*exp(-alpha*r2)`: the α² and α factors are not decoration, and dropping them happens to go unnoticed at α=1; a read-only `VGL` is refused with `TypeError`; a `float32` array is refused (`noconvert`) |
-| `test_context.py` | **M2**: create, `valid()`, `handle`, `touch()`, GC (no crash, no leak report), `Context.copy()` returns a distinct valid context (`copy.handle != ctx.handle`); **M4**: deep independence via a setter (`set_point` then read back), `touch()` re-deriving arrays |
+| `test_context.py` | **M2**: create, `valid()`, `handle`, `touch()`, GC (no crash, no leak report), `Context.copy()` returns a distinct valid context (`copy.handle != ctx.handle`); **M4**: deep independence via a setter (`set_point` then read back); the `touch()` re-derivation check lives in `test_shapes.py` |
 | `test_errors.py` | **M2**: `get_ao_basis_type` on a fresh context raises `QMCKLStatusError` whose message starts `[QMCKL_NOT_PROVIDED]` and does **not** contain `Unknown error`; `ERROR_CODES["QMCKL_SUCCESS"] == 0`; `error_name(103) == "QMCKL_INVALID_CONTEXT"`; `last_error(ctx)` returns a `str`; **M3+**: undersized buffer on `get_ao_basis_ao_value` raises with `QMCKL_INVALID_ARG_` |
-| `test_blas.py` | **M4**: `qmckl.dgemm(ctx, A, B, transa=…, transb=…)` (§7.2b) equals `alpha * op(A) @ op(B)` for all four combinations and a non-square shape; `adjugate_safe` vs `np.linalg.inv(A) * det` for a small matrix |
+| `test_blas.py` | **M4**: `qmckl.dgemm(ctx, A, B, transa=…, transb=…)` (§7.2b) equals `alpha * op(A) @ op(B)` for all four combinations, with the *inputs* built per combination (op(A) = (3, 2), op(B) = (2, 4)) so a transposed reading of either buffer cannot pass; `ValueError` on shape mismatch, bad flag and empty operands; `adjugate_safe` vs `np.linalg.inv(A) * det` for a small matrix |
 | `test_distance.py` | `distance`, `distance_sq`, `distance_rescaled` vs NumPy, including transposed layouts |
 | `test_trexio.py` | `ctx.trexio_read("tests/data/h2o_5z.h5")`; `elec_num == 10`, `nucl_num == 2`, `ao_num`/`mo_num` > 0; `mo_value` compared to reference numbers copied from the upstream C tests (`tests/test_qmckl_mo.c` in the QMCkl release tarball); whole module skipped when `qmckl.trexio_read` is absent |
-| `test_shapes.py` | each property in §7.2 has the documented shape; set/get round-trip of `point` and `nucl_coord` |
+| `test_shapes.py` | each property of §7.2 has the documented shape; set/get round-trip of `point`, `nucl_coord`, `electron_coord`; wrong shapes raise `ValueError`; `touch()` recomputes an unchanged distance; the four point-evaluated properties raise `ValueError` with no points; the basis-dependent ones use `tests/data/h2o_5z.h5` and skip without TREXIO |
 
 `tests/data/h2o_5z.h5` is copied from `share/qmckl/test_data/` of the release
 tarball and committed (4.6 MB) so the suite runs offline.
@@ -947,7 +985,7 @@ No test may depend on the user's QMCkl prefix beyond `pkg-config`.
 | M1 | `generate.py` parser + classification + `--dump-json` | **done**: 239 declarations in 6 buckets summing to 239, 0 unclassified, JSON round-trips, positional `(name, argc)` sequence identical to the independent cross-check |
 | M2 | `context.hpp/.cpp`, `module.cpp`, exception, §5.7 error table, generator skeleton emission, `context.py`/`errors.py` skeleton, `test_context.py`, `test_errors.py` | `pytest -q tests` green with zero generated bindings |
 | M3 | C++ + `.pyi` emitters (§5.4, §5.5e, §5.6), ABI override, stub installed, `tests/test_surface.py` + `tests/test_generated.py` | `import qmckl` exposes **223** generated names (222 without TREXIO) plus `Context`/`_Context`, `last_error`, `get_ao_basis_type`, `QMCKLStatusError` and `ERROR_CODES`; `qmckl_check` and `string_of_error` are absent; both test files green; the wheel ships `_core.pyi` and `py.typed`; a rebuild is byte-identical to the re-cut `--dump-json` baseline |
-| M4 | §7 Python layer + `errors.py` table | `test_shapes.py` green |
+| M4 | §7 Python layer + `errors.py` table | `test_shapes.py` **and** `test_blas.py` green |
 | M5 | full test suite | green on macOS arm64 against QMCkl 1.1.0 |
 | M6 | CI | green on ubuntu + macos, including the `--without-trexio` job |
 
@@ -991,6 +1029,17 @@ without changing the CLI, the file names, or the CMake integration.
    thread in Python (the GIL is released around every call).
 7. **`noconvert()`** — never remove it from array arguments; without it
    nanobind copies, and outputs are lost.
+8. **`qmckl_get_electron_ee_potential` / `en_potential` carry no
+   `size_max`** — the raw layer cannot check the buffer it is given; use the
+   `Context.ee_potential` / `en_potential` properties, which allocate it.
+9. **Zero points** — with `point_num == 0` the four point-evaluated providers
+   (`ao_value`, `ao_vgl`, `mo_value`, `mo_vgl`) call
+   `qmckl_malloc(ctx, {size: 0})`.  QMCkl 1.1.0 stores that record with
+   `size == 0`, which its "first free slot" scan treats as an empty slot: the
+   next allocation overwrites the record and leaks the block, while
+   `n_allocated` stays incremented, so it can never return to zero — an
+   assert-enabled `qmckl_context_destroy` aborts.  The properties raise
+   `ValueError` instead.
 
 ---
 

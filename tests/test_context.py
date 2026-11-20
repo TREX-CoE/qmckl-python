@@ -1,9 +1,12 @@
-"""M2: the Context lifecycle (PLAN.md §8, test_context.py, M2 rows).
+"""The Context lifecycle (PLAN.md §8, test_context.py).
 
-Uses only what exists at M2: no generated bindings yet, no ``set_point``.
+M2: create, handle, touch, GC, ``Context.copy()``, the manager.
+M4: deep independence via a setter (``test_copy_is_deep_for_setters``).
 """
 
 import gc
+
+import numpy as np
 
 import qmckl
 
@@ -59,3 +62,16 @@ def test_context_manager():
     with qmckl.Context() as ctx:
         assert ctx.valid()
     gc.collect()
+
+
+def test_copy_is_deep_for_setters():
+    # PLAN.md §8 M4: a setter on the copy must not touch the original.
+    ctx = qmckl.Context()
+    qmckl.set_point(ctx, "N", 2, np.array([[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]]))
+    copied = qmckl.Context.copy(ctx)
+    copied.point = np.array([[5.0, 5.0, 5.0]])
+    assert ctx.point_num == 2
+    assert copied.point_num == 1
+    assert np.array_equal(
+        ctx.point, np.array([[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]])
+    )
