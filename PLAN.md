@@ -38,8 +38,16 @@ These were measured on QMCkl **v1.1.0** (`qmckl-1.1.0.tar.gz`):
   `Cflags: -I${includedir}`, `Libs: -L${libdir} -lqmckl`. There is **no**
   `Requires:` line and no `Libs.private` for TREXIO in practice → static
   linking is not supported by this package.
-- `qmckl.h` declares **239** `qmckl_*` functions (count with the parser in
-  §5.1): 223 return `qmckl_exit_code`.
+- `qmckl.h` declares **239** `qmckl_*` declarations but only **237 unique
+  names**: `qmckl_get_jastrow_champ_grad` (line 2251 and 2256) and
+  `qmckl_compute_ao_polynomial_hessian_doc` (line 1700 and 1716) appear twice,
+  byte-identical, a tangling artifact of the release tarball. 223 return
+  `qmckl_exit_code`; the other 16 are `bool` (5), `int32_t` (4),
+  `qmckl_context` (3: create/copy/check), `void` (2: lock/unlock),
+  `const char*` (1: `qmckl_string_of_error`) and `double` (1:
+  `qmckl_get_numprec_epsilon`).
+- `qmckl_test_precision_64` and `_32` take **no context** argument at all —
+  the emitted wrapper must not assume `ctx` as the first parameter.
 - Array/size conventions:
   - **125 functions**: `(ctx, <one array>, size_max)` — the getter/setter shape.
   - `qmckl_dgemm_safe` has `size_max_A/B/C`; `qmckl_adjugate_safe` has
@@ -183,10 +191,28 @@ generate.py --header PATH/qmckl.h --dump-json OUT.json     # for review/diffing
 
 Sanity assertions (fail loudly, do not guess):
 
-- `len(functions) >= 230`
+- `len(functions) >= 230` declarations
 - `"qmckl_dgemm_safe" in names` (this symbol marks the ≥ 1.1 API)
 - every pointer parameter is classified by §5.3/§5.5 rules
 - no Python keyword remains among argument names after suffixing with `_`
+- the buckets partition the declarations exactly (sum == the number of
+  declarations parsed; 239 on QMCkl 1.1.0), and any unclassified function is
+  printed by name and makes the run exit 1
+- the declaration count is **reported, not asserted**: a 1.1.x header that adds
+  or de-duplicates a declaration must still build, and new declarations land in
+  `generated` through §5.2. Drift in the hand-audited §5.5 tables is what is
+  fatal (a table name absent from the header), because the classification of
+  those names was audited by hand.
+
+**Duplicates.** Two names are declared twice, byte-identically. The IR keeps
+one record per declaration in header order, but the emitters (and the stub)
+must **de-duplicate by name, first occurrence wins**; otherwise nanobind
+registers two identical overloads and `dir(_core)` lies about the surface.
+
+**No context.** `qmckl_test_precision_64/_32` take no context. The IR carries
+`has_context`; the emitter must omit the context parameter, the `ctx.h`
+argument and the `qmckl::check(ctx.h, ...)` call — those two functions return
+an `int32_t` used directly.
 
 ### 5.2 Type mapping
 
@@ -259,6 +285,17 @@ m.def("get_mo_basis_mo_value",
 All `m.def`s are emitted inside `void qmckl_python::register_generated(nb::module_ &m)`;
 `csrc/module.cpp` declares and calls it. No docstrings in v1.
 
+Two mechanical variations on this template:
+
+- **No context** (`qmckl_test_precision_64/_32`): drop the `qmckl::Context &`
+  parameter, the `ctx.h` argument, and the `check()` call; `rc` is not an exit
+  code but the value to return.
+- **In/out scalar pointers** (`int64_t *n` in the eight polynomial/hessian
+  functions, `double *det_l` in `qmckl_adjugate`): they follow §5.2 like any
+  other non-const `T *`, i.e. a one-element array the caller allocates
+  (`np.zeros(1, dtype=np.int64)`). Do not invent an out-of-band return value;
+  consistency with the C signature is worth more than prettiness here.
+
 ### 5.5 Special cases (explicit tables in the generator)
 
 **(a) Scalar out-parameters** — one pointer parameter, scalar element type, no
@@ -296,7 +333,20 @@ qmckl_lock / qmckl_unlock                          -> not exposed
 qmckl_get_error / _set_error / _failwith           -> not exposed
 qmckl_last_error                                   -> qmckl.last_error(ctx) -> str
 qmckl_get_ao_basis_type                            -> qmckl.get_ao_basis_type(ctx) -> str
+qmckl_string_of_error                              -> not exposed (see §2: the
+     released 1.1.0 tarball ships it with an empty switch and it returns
+     "Unknown error" for every code; qmckl.errors.error_name() is the
+     replacement and is built from the header macros)
 ```
+
+Counts as measured by the M1 parser (QMCkl 1.1.0, TREXIO on): generated 204,
+scalar_out 18, array_no_size_max 4, handwritten 7, excluded 5, trexio 1 →
+239. Adding `qmckl_string_of_error` to the excluded set moves it from
+*generated* to *excluded*: generated 203, excluded 6, emitted declarations
+226, and **224 distinct generated bindings** after de-duplicating the two
+repeated declarations (223 when `qmckl_trexio_read` is dropped, see (d)). The
+generator must print this partition and exit non-zero if the buckets do not sum
+to the declaration count.
 
 **(d) TREXIO** — when the linked library does not export `qmckl_trexio_read`,
 skip that binding entirely (do not emit a stub for it either).
@@ -318,6 +368,38 @@ class QMCKLStatusError(RuntimeError): ...
 ```
 
 The module must expose nothing else at top level.
+
+### 5.7 Error-code table (emitted in M2, grown in M3)
+
+The code names come from the header, never from a checked-in copy and never
+from `qmckl_string_of_error` (§2). A second, independent pass over the **raw**
+header text (do not reuse the stripped text of §5.1) scans
+
+```
+#define  QMCKL_SUCCESS                  ((qmckl_exit_code) 0)
+#define  QMCKL_INVALID_ARG_1            ((qmckl_exit_code) 1)
+```
+
+i.e. `^\s*#\s*define\s+(QMCKL_[A-Z0-9_]+)\s+\(\s*\(\s*qmckl_exit_code\s*\)\s*(-?\d+)\s*\)\s*$`.
+Note the two spaces after `#define` and the mandatory `((qmckl_exit_code) N)`
+cast: a bare `#define QMCKL_X 3` does not occur in 1.1.0 and must not be
+guessed at. Assert at least 30 codes, `QMCKL_SUCCESS` present with value 0, no
+duplicate name and no duplicate value, and `QMCKL_INVALID_ARG_20` present (that
+marks the 1.1 API). Failure = exit 1.
+
+Two emissions, from that one table:
+
+1. `const char *qmckl::code_name(int32_t rc)` in the generated translation unit
+   (declared in `context.hpp`): a `switch` over the values, returning the name
+   as a string literal; anything else returns `"QMCKL_UNKNOWN"`. Values are
+   emitted as bare integers (`case 103:`), not as macro names, so the generated
+   file does not depend on macros that a future header could rename.
+2. `void qmckl_python::register_error_codes(nb::module_ &m)` in the same file,
+   setting `m.attr("ERROR_CODES")` to a `nb::dict` of name → int. `errors.py`
+   builds `error_name()` by inverting it.
+
+Both are emitted in M2 together with the skeleton of §10; M3 adds the per
+function bindings and does not touch them.
 
 ---
 
@@ -342,17 +424,37 @@ struct QMCKLStatusError : std::runtime_error {
 };
 
 [[noreturn]] void check(int64_t ctx, int32_t rc, const char *fname);
-const char *code_name(int32_t rc);    // generated table, see §5.6/§7
+const char *code_name(int32_t rc);    // emitted from the header macros, §5.7
 }
 ```
 
 `check(ctx, rc, fname)` behaviour:
 
 - `rc == 0` → return.
-- otherwise build `"[<CODE_NAME>] <fname>: <message>"`, where `<message>` comes
-  from `qmckl_get_error(ctx, &code, fun, msg)` when
-  `qmckl_context_check(ctx) != 0`, and from `code_name(rc)` alone otherwise.
-- throw `QMCKLStatusError`.
+- otherwise build `"[<CODE_NAME>] <fname>: <message>"` and throw
+  `QMCKLStatusError`.
+- `<CODE_NAME>` comes from the generated `code_name(rc)` table; it never fails.
+- `<message>` comes from `qmckl_get_error(ctx, &stored, fun, msg)` **only when
+  `qmckl_context_check(ctx) != QMCKL_NULL_CONTEXT`** (the C function asserts on
+  an invalid context) **and `stored == rc`**. The `stored == rc` test matters:
+  QMCkl stores the last error per context, and several functions return
+  `QMCKL_NULL_CONTEXT` or a `provide_*` failure **without** writing it, so an
+  unchecked read would print a stale message from an unrelated earlier call.
+  When the two disagree, print the code name alone.
+- Suppress the message when it is empty **or exactly `"Unknown error"`**: that
+  is the string `qmckl_string_of_error` produces for every code in the released
+  tarball, and `qmckl_failwith(..., NULL)` stores it verbatim. So
+  `qmckl_get_ao_basis_type` on a fresh context must read
+  `[QMCKL_NOT_PROVIDED] qmckl_get_ao_basis_type`, not `… : Unknown error`.
+  Resulting formats, both acceptable:
+  `"[CODE] fname: message"` and `"[CODE] fname"`.
+- Buffer sizes are not optional. `qmckl_get_error` `memcpy`s up to
+  `QMCKL_MAX_FUN_LEN` bytes (256) and `QMCKL_MAX_MSG_LEN` bytes (1024) **and
+  never writes a NUL terminator**. Use `char fun[QMCKL_MAX_FUN_LEN + 1]{};`
+  and `char msg[QMCKL_MAX_MSG_LEN + 1]{};` — zero-initialised, one byte of
+  slack. Do not shrink them to "what the message looks like".
+- No GIL concern: `check()` runs with the GIL re-acquired (the release scope
+  closes before it is called).
 
 `code_name` is emitted next to the generated bindings from the
 `#define QMCKL_*` macros of the header (single source of truth). Do **not** call
@@ -376,12 +478,21 @@ NB_MODULE(_core, m) {
         })
         .def_prop_ro("handle", [](const qmckl::Context &c) { return c.h; });
 
-    m.def("last_error", ...);            // 2048-byte buffer, no GIL issues
+    m.def("last_error", ...);            // see below
     m.def("get_ao_basis_type", ...);     // char buffer -> str
 
+    qmckl_python::register_error_codes(m);   // _core.ERROR_CODES, §5.7
     qmckl_python::register_generated(m);
 }
 ```
+
+`last_error(ctx) -> str` does **not** call `::qmckl_last_error`. That C
+function formats its text with `qmckl_string_of_error(last_rc)`, which is the
+broken empty switch of §2, so every message would read `Error -- Unknown
+error -- in …`. Compose it instead from `qmckl_get_error` (same 257/1025
+zero-initialised buffers as `check()`) and `code_name()`:
+`"[<CODE_NAME>] <function>: <message>"`, and return `"Null context"` when
+`qmckl_context_check(ctx) == QMCKL_NULL_CONTEXT` (matching the C wording).
 
 Order matters: the exception and `_Context` must be registered before the
 generated functions reference them in signatures.
@@ -404,6 +515,9 @@ parameter type is `qmckl::Context &`.
 
 ### 7.2 `src/qmckl/context.py`
 
+M2 ships this file with exactly the class below (plus nothing else); M4 adds
+the properties and setters, in this same file.
+
 ```python
 class Context(_core._Context):
     @classmethod
@@ -422,7 +536,7 @@ shape and returns it; setters accept any array-like via
 
 | attribute | shape | C calls |
 |---|---|---|
-| `point` (get/set) | `(point_num, 3)` | `get_point`/`set_point`, `transp` inferred from `x.shape[-1] == 3` |
+| `point` (get/set) | `(point_num, 3)` | `get_point`/`set_point` with `transp='N'` |
 | `electron_coord` | `(walk_num, elec_num, 3)` | `get/set_electron_coord` |
 | `nucl_coord` | `(nucl_num, 3)` | `get/set_nucleus_coord` |
 | `ao_value` | `(point_num, ao_num)` | `get_ao_basis_ao_value` |
@@ -446,8 +560,11 @@ mo_value = property(lambda self: self._get(
     _core.get_mo_basis_mo_value, (self.point_num, self.mo_num)))
 ```
 
-Setters: `set_point(coords)` derives `num = coords.shape[0]` and `transp` from
-the layout; `set_nucleus_coord`, `set_electron_coord` likewise.
+Setters: `set_point(coords)` derives `num = coords.shape[0]` and passes
+`transp='N'` (verified: `qmckl_get_point`/`qmckl_set_point` with `'N'` are the
+`(num, 3)` row-major layouts — internally QMCkl stores a 3×num matrix and
+transposes for `'N'`); `set_nucleus_coord`, `set_electron_coord` likewise. The
+`'T'` layout stays available in the raw layer only.
 
 `trexio_read(path)` → `_core.trexio_read(self, str(path))`; raise
 `NotImplementedError` when the symbol is absent (checked once at import).
@@ -458,7 +575,9 @@ argument tables in `org/qmckl_*.org` of the QMCkl sources.
 ### 7.3 `src/qmckl/errors.py`
 
 `ERROR_CODES: dict[str, int]` and `error_name(code) -> str`, both from the
-table generated into the extension. `ERROR_CODES` covers `QMCKL_SUCCESS`,
+table generated into the extension (§5.7): `from ._core import ERROR_CODES`
+and invert it for `error_name`. Nothing is retyped by hand; the header is the
+single source of truth. `ERROR_CODES` covers `QMCKL_SUCCESS`,
 `QMCKL_INVALID_ARG_1..20`, `QMCKL_FAILURE`, `QMCKL_ERRNO`,
 `QMCKL_INVALID_CONTEXT`, `QMCKL_ALLOCATION_FAILED`,
 `QMCKL_DEALLOCATION_FAILED`, `QMCKL_NOT_PROVIDED`, `QMCKL_OUT_OF_BOUNDS`,
@@ -470,9 +589,9 @@ table generated into the extension. `ERROR_CODES` covers `QMCKL_SUCCESS`,
 
 | file | asserts |
 |---|---|
-| `test_surface.py` | every name in `_core.pyi` is present in `dir(_core)`; ≥ 230 public callables; `get_mo_basis_mo_value` and `dgemm_safe` present; `qmckl.__all__` importable |
-| `test_context.py` | create/GC; `Context.copy()` is independent (modify one, the other unchanged); `valid()`; `touch()` after `set_point` re-derives arrays; destroyed handle is not reachable |
-| `test_errors.py` | undersized buffer on `get_ao_basis_ao_value` raises `QMCKLStatusError` whose message contains `QMCKL_INVALID_ARG_`; unprovided context yields `QMCKL_NOT_PROVIDED`; `qmckl.last_error(ctx)` returns a str |
+| `test_surface.py` | every name in `_core.pyi` is present in `dir(_core)`; the count of generated names equals the number of `def`s in the stub and is ≥ 220; `get_mo_basis_mo_value`, `dgemm_safe`, `check`, `test_precision_64` present; `string_of_error` **absent** (deliberate, §5.5c); `qmckl.__all__` importable |
+| `test_context.py` | **M2**: create, `valid()`, `handle`, `touch()`, GC (no crash, no leak report), `Context.copy()` returns a distinct valid context (`copy.handle != ctx.handle`); **M4**: deep independence via a setter (`set_point` then read back), `touch()` re-deriving arrays |
+| `test_errors.py` | **M2**: `get_ao_basis_type` on a fresh context raises `QMCKLStatusError` whose message starts `[QMCKL_NOT_PROVIDED]` and does **not** contain `Unknown error`; `ERROR_CODES["QMCKL_SUCCESS"] == 0`; `error_name(103) == "QMCKL_INVALID_CONTEXT"`; `last_error(ctx)` returns a `str`; **M3+**: undersized buffer on `get_ao_basis_ao_value` raises with `QMCKL_INVALID_ARG_` |
 | `test_blas.py` | `dgemm_safe` vs `A @ B` (all four `transa`/`transb`); `adjugate_safe` vs `np.linalg.inv(A) * det` for a small matrix |
 | `test_distance.py` | `distance`, `distance_sq`, `distance_rescaled` vs NumPy, including transposed layouts |
 | `test_trexio.py` | `ctx.trexio_read("tests/data/h2o_5z.h5")`; `elec_num == 10`, `nucl_num == 2`, `ao_num`/`mo_num` > 0; `mo_value` compared to reference numbers copied from the upstream C tests (`tests/test_qmckl_mo.c` in the QMCkl release tarball); whole module skipped when `qmckl.trexio_read` is absent |
@@ -509,12 +628,33 @@ No test may depend on the user's QMCkl prefix beyond `pkg-config`.
 | # | Deliverable | Accepted when |
 |---|---|---|
 | M0 | `pyproject.toml`, `CMakeLists.txt`, `README.md`, `LICENSE`, `.gitignore`, placeholder `src/qmckl/__init__.py` | **done, configure-verified**; `pip install -e .` now stops at `qmckl.cmake` missing / `csrc/generate.py` missing, never at pkg-config for a valid 1.x install |
-| M1 | `generate.py` parser + classification + `--dump-json` | 239 functions classified, zero unclassified, JSON diffable |
-| M2 | `context.hpp/.cpp`, `module.cpp`, exception | `test_context.py`, `test_errors.py` green |
+| M1 | `generate.py` parser + classification + `--dump-json` | **done**: 239 declarations in 6 buckets summing to 239, 0 unclassified, JSON round-trips, positional `(name, argc)` sequence identical to the independent cross-check |
+| M2 | `context.hpp/.cpp`, `module.cpp`, exception, §5.7 error table, generator skeleton emission, `context.py`/`errors.py` skeleton, `test_context.py`, `test_errors.py` | `pytest -q tests` green with zero generated bindings |
 | M3 | C++ + `.pyi` emitters, stub installed | `import qmckl` exposes the surface; `test_surface.py` green |
 | M4 | §7 Python layer + `errors.py` table | `test_shapes.py` green |
 | M5 | full test suite | green on macOS arm64 against QMCkl 1.1.0 |
 | M6 | CI | green on ubuntu + macos, including the `--without-trexio` job |
+
+**Ordering constraint M2 ↔ M3.** The runtime cannot be tested without a
+buildable extension, and the extension compiles `generated_bindings.cpp`, which
+only the generator can write. So M2 must *replace* `generate.py`'s
+"emission is implemented in M3, refusing to emit" guard with a real writer that
+produces a **compilable skeleton**:
+
+```cpp
+// generated_bindings.cpp
+#include <nanobind/nanobind.h>
+#include "context.hpp"
+
+namespace qmckl_python {
+void register_generated(nb::module_ &m) { (void) m; }
+}
+```
+
+plus an empty `_core.pyi`. Every intermediate state then builds, `m.def` count
+is zero, and `test_context.py` / `test_errors.py` exercise the hand-written
+layer for real. M3 grows that skeleton into the per-function loop and the stub,
+without changing the CLI, the file names, or the CMake integration.
 
 ---
 
