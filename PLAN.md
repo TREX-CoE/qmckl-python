@@ -169,15 +169,27 @@ Written and validated on 2026-11-20 against QMCkl 1.1.0. It:
    *Both branches were exercised.*
 2. Locates `qmckl.h` via `find_path(... PATHS ${QMCKL_INCLUDE_DIRS}
    NO_DEFAULT_PATH)` → `QMCKL_HEADER`.
-3. Detects whether the linked library exports `qmckl_trexio_read` by
+3. Detects whether the linked library was **built with TREXIO support** by
    concatenating the output of `nm -D` **and** `nm -g` on the resolved
-   `libqmckl` and searching the union. Neither flag works everywhere
-   (verified: on macOS `nm -D` fails with "File format has no dynamic symbol
-   table" while `nm -g` finds 25 occurrences; on a stripped Linux `.so` it is
-   the other way round). `-DQMCKL_HAS_TREXIO=AUTO|ON|OFF` overrides; if neither
-   `nm` run succeeds the configure fails and asks for the explicit flag rather
-   than guessing. *Verified ON against the 1.1.0 install and OFF via the
-   override.*
+   `libqmckl` and searching the union for `trexio_open`. The obvious
+   candidate, `qmckl_trexio_read`, cannot be the predicate: `qmckl.h`
+   declares it unconditionally and the 1.1.0 release tarball defines it even
+   under `--without-trexio`, as a stub returning `QMCKL_FAILURE`
+   ("QMCkl was compiled without TREXIO"). Measured counts: the no-TREXIO
+   build's symbol table holds exactly one trexio symbol (`T
+   _qmckl_trexio_read`, the stub) and `trexio_open` **zero** times; the
+   with-TREXIO build holds 29 trexio symbols, `trexio_open` twice (once as
+   the imported `U _trexio_open`, once inside `T _qmckl_trexio_open_X`).
+   The search is a substring, not a `U` anchor, because a **statically
+   linked** TREXIO appears as a defined `T` symbol; `qmckl_trexio_open_X`
+   also matches but exists only under `HAVE_TREXIO`. Neither flag works
+   everywhere (verified: on macOS `nm -D` fails with "File format has no
+   dynamic symbol table" while `nm -g` finds the symbols; on a stripped
+   Linux `.so` it is the other way round). `-DQMCKL_HAS_TREXIO=AUTO|ON|OFF`
+   overrides; if neither `nm` run succeeds the configure fails and asks for
+   the explicit flag rather than guessing. *Re-verified against real builds
+   after the M6 predicate fix: the two §9 dry runs print
+   `TREXIO I/O bound = ON` (with-TREXIO) and `= OFF` (no-TREXIO).*
 4. Runs `csrc/generate.py` as a custom command producing
    `${CMAKE_CURRENT_BINARY_DIR}/generated_bindings.cpp` and
    `${CMAKE_CURRENT_BINARY_DIR}/_core.pyi`.
@@ -505,8 +517,9 @@ only change `--dump-json` sees relative to the M1 baseline, so the M1
 acceptance dump is re-cut at M3 and the byte-identical comparison runs against
 the re-cut file.
 
-**(d) TREXIO** — when the linked library does not export `qmckl_trexio_read`,
-skip that binding entirely (do not emit a stub for it either).
+**(d) TREXIO** — when the linked library was built without TREXIO support
+(§4.2 item 3: the probe looks for `trexio_open`), skip that binding entirely
+(do not emit a stub for it either).
 
 **(e) Header/ABI divergence — two functions.** The header is wrong for
 `qmckl_ao_gaussian_vgl` and `qmckl_ao_slater_vgl` (§2). The generator carries
@@ -960,20 +973,61 @@ No test may depend on the user's QMCkl prefix beyond `pkg-config`.
 
 ## 9. CI
 
-`.github/workflows/ci.yml`, matrix `ubuntu-latest` (py 3.10, 3.12) and
-`macos-14` (py 3.12):
+`.github/workflows/ci.yml` (written and dry-run-validated 2026-11-20 on the
+QMCkl 1.1.0 release tarball, macOS arm64). One `test` job, `fail-fast:
+false`, `QMCKL_VERSION` and the tarball's sha256 pinned as job env.
 
-1. `micromamba create -p $PWD/env -c conda-forge trexio hdf5 gfortran`
-   (TREXIO prebuilt on both OSes; `gfortran` satisfies QMCkl's `AC_PROG_FC`,
-   which macOS runners lack).
-2. Build QMCkl 1.1.0 from the release tarball:
-   `./configure --prefix=$PWD/qmckl --without-openmp && make -j && make install`.
-3. `export PKG_CONFIG_PATH=$PWD/qmckl/lib/pkgconfig:$PWD/env/lib/pkgconfig`
-   plus the matching `LD_LIBRARY_PATH`/`DYLD_LIBRARY_PATH`.
-4. `pip install -e . --no-build-isolation` then `pytest -q`.
-5. Cache `env/` and `qmckl/` on the pinned versions.
-6. Extra job: same, but QMCkl built `--without-trexio`; must build, must pass,
-   and `hasattr(qmckl, "trexio_read")` must be `False`.
+1. Four matrix cells: `ubuntu-latest` py3.10 and py3.12 with TREXIO,
+   `macos-14` py3.12 with TREXIO, and one `ubuntu-latest` py3.12
+   `--without-trexio` job (it carries `qmckl_flags: --without-trexio` and
+   `trexio: "false"`).
+2. `mamba-org/setup-micromamba@v2` builds `qmckl-env` from conda-forge with
+   `trexio hdf5 gfortran` (conda-forge has `osx-arm64` TREXIO builds;
+   `gfortran` supplies the Fortran compiler, since QMCkl always compiles its
+   `.F90` sources and macOS runners ship none — the build step points `FC`
+   at `$ENV_PREFIX/bin/gfortran`, which `AC_PROG_FC` honours). The
+   environment is cached (`cache-environment: true`) and its prefix is read
+   from the action's `environment-path` output.
+3. The release tarball is downloaded with `curl` and verified against the
+   pinned sha256 (`sha256sum -c -` on Linux, `shasum -a 256 -c -` on macOS),
+   then configured with `--prefix=$PWD/qmckl --without-openmp`
+   (§11 trap 6) plus `--with-trexio=$ENV_PREFIX`. The directory form is
+   what `configure.ac` turns into `-I$dir/include -L$dir/lib -ltrexio`
+   directly, so the conda TREXIO package needs no `.pc` file. The `qmckl/`
+   prefix is cached with `actions/cache@v4` keyed on
+   `qmckl-<version>-<runner.os>-<runner.arch>-trexio-<flag>`; on a hit the
+   build step is skipped.
+4. `make -j"$(getconf _NPROCESSORS_ONLN)"` and `make install`. No race on
+   generated sources was measured (the tarball ships already-tangled C).
+5. A step appends to `$GITHUB_ENV`: `PKG_CONFIG_PATH` (qmckl prefix first,
+   then `$ENV_PREFIX/lib/pkgconfig`) and, with the same two prefixes joined
+   by `:`, `LD_LIBRARY_PATH` and `DYLD_LIBRARY_PATH` — `qmckl.pc` does not
+   propagate TREXIO (§11 trap 2), so the loader must be told where both
+   libraries live. The same step exports `PKG_CONFIG_PATH` locally (variables
+   from `$GITHUB_ENV` are only visible to later steps) and runs
+   `pkg-config --modversion qmckl` so a bad prefix fails immediately with a
+   clear message.
+6. `pip install --upgrade pip`, then
+   `pip install nanobind scikit-build-core cmake ninja numpy pytest` (the
+   build toolchain comes from the same line on every runner), then
+   `pip install -e . --no-build-isolation`; a one-line presence check
+   asserts `hasattr(qmckl, "trexio_read") is (EXPECT_TREXIO == "true")`
+   with `EXPECT_TREXIO` from the matrix; finally `pytest -q`. The
+   `--without-trexio` job runs the same pipeline against a QMCkl built
+   without TREXIO, where the CMake `nm` probe (§4) binds `trexio_read`
+   only if the library was built with TREXIO support (the `trexio_open`
+   probe, §4.2 item 3).
+
+**TREXIO probe corrected during M6.** The original premise did not hold:
+`qmckl.h` declares `qmckl_trexio_read` unconditionally, and the 1.1.0
+release tarball defines it even under `--without-trexio`, as a stub
+returning `QMCKL_FAILURE` (the `#else` branch of `src/qmckl_trexio.c`), so
+a symbol-presence predicate cannot tell the builds apart. The CMake
+predicate was changed from `qmckl_trexio_read` to `trexio_open`
+(§4.2 item 3), which appears only when the library was actually built with
+TREXIO support, and the `--without-trexio` cell now meets its original
+expectation: `trexio_read` unbound, presence check passing with
+`EXPECT_TREXIO=false`, and the TREXIO-dependent tests skipping.
 
 ---
 
@@ -987,7 +1041,11 @@ No test may depend on the user's QMCkl prefix beyond `pkg-config`.
 | M3 | C++ + `.pyi` emitters (§5.4, §5.5e, §5.6), ABI override, stub installed, `tests/test_surface.py` + `tests/test_generated.py` | `import qmckl` exposes **223** generated names (222 without TREXIO) plus `Context`/`_Context`, `last_error`, `get_ao_basis_type`, `QMCKLStatusError` and `ERROR_CODES`; `qmckl_check` and `string_of_error` are absent; both test files green; the wheel ships `_core.pyi` and `py.typed`; a rebuild is byte-identical to the re-cut `--dump-json` baseline |
 | M4 | §7 Python layer + `errors.py` table | `test_shapes.py` **and** `test_blas.py` green |
 | M5 | `tests/test_distance.py` + `tests/test_trexio.py`, completing the suite | green on macOS arm64 against QMCkl 1.1.0 |
-| M6 | CI | green on ubuntu + macos, including the `--without-trexio` job |
+| M6 | `.github/workflows/ci.yml`, four jobs | green on ubuntu + macos, including the `--without-trexio` job — 2026-11-20 dry runs against the 1.1.0 tarball: with-TREXIO 56 passed; no-TREXIO 51 passed, 5 skipped |
+
+The M6 acceptance is met once the repository has a GitHub remote and the
+workflow has run at least once there, since it cannot be executed locally;
+the §9 dry runs are the validation on record.
 
 **Ordering constraint M2 ↔ M3.** The runtime cannot be tested without a
 buildable extension, and the extension compiles `generated_bindings.cpp`, which
@@ -1020,8 +1078,14 @@ without changing the CLI, the file names, or the CMake integration.
    `libqmckl.a` will not link.
 3. **Raw layer** — a wrongly shaped array with sufficient size is silently
    reinterpreted (C semantics). Use the `Context` properties.
-4. **TREXIO absence** — `qmckl.trexio_read` does not exist in such a build;
-   `hasattr` is the documented check.
+4. **TREXIO support is a capability, not a symbol** — `qmckl.h` declares
+   `qmckl_trexio_read` unconditionally, and the 1.1.0 release tarball
+   defines it even under `--without-trexio`, as a stub returning
+   `QMCKL_FAILURE` ("QMCkl was compiled without TREXIO").
+   `hasattr(qmckl, "trexio_read")` is a valid check only because the build
+   probe (§4.2 item 3) refuses to bind the stub; forcing
+   `-DQMCKL_HAS_TREXIO=ON` on such a build binds the stub, and the call
+   then raises `QMCKLStatusError` with that message.
 5. **`qmckl_string_of_error` is broken in 1.1.0 tarball builds**; the package
    uses its own table.
 6. **OpenMP** — a QMCkl built with `--enable-openmp` spawns threads inside a

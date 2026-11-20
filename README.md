@@ -142,8 +142,10 @@ raw column-major functions remain available as `qmckl._core.dgemm` and
 3. **Shapes are not checked** in the raw layer. A wrongly shaped but large
    enough array is reinterpreted with C semantics. Use the `Context`
    properties, which allocate and check the documented shapes.
-4. **TREXIO.** `qmckl.trexio_read` only exists if the linked library exports
-   it. Check with `hasattr(qmckl, "trexio_read")`.
+4. **TREXIO.** `qmckl.trexio_read` exists only if the linked library was
+   built with TREXIO support: QMCkl 1.1.0 exports a `qmckl_trexio_read`
+   stub even without TREXIO, so the build probe (not the symbol) decides.
+   Check with `hasattr(qmckl, "trexio_read")`; see PLAN §11 trap 4.
 5. **OpenMP.** A QMCkl built with `--enable-openmp` starts threads inside a
    single Python call. Prefer `--without-openmp` and thread in Python; the GIL
    is released, so NumPy/threading concurrency works.
@@ -178,6 +180,13 @@ python csrc/generate.py --header $(pkg-config --variable=includedir qmckl)/qmckl
 The generator is the only place that knows about C types. It parses the header,
 classifies the declarations, and writes `generated_bindings.cpp` and
 `_core.pyi` into the build directory; both are installed next to the extension.
+
+## Continuous integration
+
+CI builds QMCkl 1.1.0 from the pinned release tarball against a conda-forge
+TREXIO/gfortran environment (micromamba) and runs the suite on ubuntu
+py3.10/py3.12 and macos-14 py3.12, plus one `--without-trexio` job, which
+verifies `trexio_read` is not bound.
 
 ## License
 

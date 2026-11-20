@@ -56,13 +56,17 @@ endif()
 set(QMCKL_HEADER "${QMCKL_INCLUDE_DIR}/qmckl.h")
 
 # ---------------------------------------------------------------------------
-# 2. Does the linked library actually provide TREXIO I/O?
+# 2. Was the linked library built with TREXIO support?
 #
-# qmckl.h declares qmckl_trexio_read unconditionally, but a library built with
-# --without-trexio does not define it.  Bind only what the library exports.
+# qmckl.h declares qmckl_trexio_read unconditionally, and the 1.1.0 release
+# tarball defines it even under --without-trexio, as a stub returning
+# QMCKL_FAILURE ("QMCkl was compiled without TREXIO"): the symbol's presence
+# says nothing about the capability.  What separates the two builds is
+# whether the library references TREXIO at all, i.e. whether 'trexio_open'
+# appears in the symbol table.  See PLAN.md §4.2 (item 3) and §11 trap 4.
 # ---------------------------------------------------------------------------
 set(QMCKL_HAS_TREXIO "AUTO" CACHE STRING
-    "Whether the linked libqmckl exports qmckl_trexio_read (AUTO/ON/OFF)")
+    "Whether the linked libqmckl was built with TREXIO support (AUTO/ON/OFF)")
 set_property(CACHE QMCKL_HAS_TREXIO PROPERTY STRINGS AUTO ON OFF)
 
 if(QMCKL_HAS_TREXIO STREQUAL "AUTO")
@@ -100,7 +104,9 @@ if(QMCKL_HAS_TREXIO STREQUAL "AUTO")
       "QMCkl was built with TREXIO support.")
   endif()
 
-  string(FIND "${_qmckl_nm_out}" "qmckl_trexio_read" _qmckl_trexio_pos)
+  # Substring, not a '^U' anchor: a statically linked TREXIO appears as a
+  # defined 'T' symbol (PLAN.md §4.2 item 3, §11 trap 4).
+  string(FIND "${_qmckl_nm_out}" "trexio_open" _qmckl_trexio_pos)
   if(_qmckl_trexio_pos EQUAL -1)
     set(QMCKL_HAS_TREXIO OFF)
   else()
