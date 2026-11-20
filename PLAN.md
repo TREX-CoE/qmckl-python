@@ -1084,6 +1084,13 @@ already succeeds there; keeping the same pair on both OSes makes the
 import independent of what libtool happens to bake in, and costs
 nothing.
 
+**Third CI run (44794294840) is green on all four cells**, post steps
+included: `56 passed` on ubuntu py3.10 and py3.12 (both restored the
+cached QMCkl prefix), `51 passed` + 5 skipped on `--without-trexio`,
+`56 passed` on `macos-latest`. The macOS prefix was rebuilt (its save
+had died in run #2 with the post-phase failure) and saved successfully;
+from here both prefixes are cached.
+
 **TREXIO probe corrected during M6.** The original premise did not hold:
 `qmckl.h` declares `qmckl_trexio_read` unconditionally, and the 1.1.0
 release tarball defines it even under `--without-trexio`, as a stub
@@ -1107,11 +1114,11 @@ expectation: `trexio_read` unbound, presence check passing with
 | M3 | C++ + `.pyi` emitters (§5.4, §5.5e, §5.6), ABI override, stub installed, `tests/test_surface.py` + `tests/test_generated.py` | `import qmckl` exposes **223** generated names (222 without TREXIO) plus `Context`/`_Context`, `last_error`, `get_ao_basis_type`, `QMCKLStatusError` and `ERROR_CODES`; `qmckl_check` and `string_of_error` are absent; both test files green; the wheel ships `_core.pyi` and `py.typed`; a rebuild is byte-identical to the re-cut `--dump-json` baseline |
 | M4 | §7 Python layer + `errors.py` table | `test_shapes.py` **and** `test_blas.py` green |
 | M5 | `tests/test_distance.py` + `tests/test_trexio.py`, completing the suite | green on macOS arm64 against QMCkl 1.1.0 |
-| M6 | `.github/workflows/ci.yml`, four jobs | green on ubuntu + macos, including the `--without-trexio` job — run 44789003065: all four cells failed (retired `macos-14` label; no BLAS/LAPACK on the runners), fixed with `macos-latest` + conda `openblas` + `--with-blas`/`--with-lapack`; run 44791325252: every functional step green on all four cells (56 passed; 51 passed + 5 skipped no-TREXIO) but the macOS job died in its post phase (job-wide `DYLD_LIBRARY_PATH` → conda `libiconv` vs Homebrew `gtar`/`git`), fixed by step-scoped loader vars — run #3 will decide; 2026-11-20 dry runs from a conda-forge env: with-TREXIO 56 passed; no-TREXIO 51 passed, 5 skipped |
+| M6 | `.github/workflows/ci.yml`, four jobs | green on ubuntu + macos, including the `--without-trexio` job — run 44789003065: all four cells failed (retired `macos-14` label; no BLAS/LAPACK on the runners), fixed with `macos-latest` + conda `openblas` + `--with-blas`/`--with-lapack`; run 44791325252: every functional step green on all four cells (56 passed; 51 passed + 5 skipped no-TREXIO) but the macOS job died in its post phase (job-wide `DYLD_LIBRARY_PATH` → conda `libiconv` vs Homebrew `gtar`/`git`), fixed by step-scoped loader vars; run 44794294840: green on all four cells, post steps included (ubuntu 56/56 and no-TREXIO 51+5 restored the cached prefix, macOS rebuilt and saved it); 2026-11-20 dry runs from a conda-forge env: with-TREXIO 56 passed; no-TREXIO 51 passed, 5 skipped |
 
-The M6 acceptance is met once the repository has a GitHub remote and the
-workflow has run at least once there, since it cannot be executed locally;
-the §9 dry runs are the validation on record.
+The M6 acceptance is met: the repository has a GitHub remote and run
+44794294840 is green on all four cells, including `--without-trexio`.
+The §9 dry runs remain the local validation on record.
 
 **Ordering constraint M2 ↔ M3.** The runtime cannot be tested without a
 buildable extension, and the extension compiles `generated_bindings.cpp`, which
